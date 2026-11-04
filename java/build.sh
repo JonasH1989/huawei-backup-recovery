@@ -27,7 +27,7 @@ fi
 
 APP_NAME="Huawei-Backup-Recovery"
 MAIN_CLASS="de.jonas.huaweibackup.ui.RecoveryWindow"
-VERSION="1.2.0"
+VERSION="1.3.0"
 OUT="out"
 
 build() {

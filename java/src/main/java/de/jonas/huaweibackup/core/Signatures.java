@@ -21,12 +21,13 @@ public final class Signatures {
         {(byte) 0x1a, 0x45, (byte) 0xdf, (byte) 0xa3},    // Matroska
         {0x66, 0x4c, 0x61, 0x43},                          // FLAC
         {0x49, 0x44, 0x33},                                // MP3 (ID3)
+        {0x4f, 0x67, 0x67, 0x53},                          // OGG (Vorbis/Opus)
         {0x3c, 0x3f, 0x78, 0x6d, 0x6c},                    // XML
         {0x50, 0x4b, 0x03, 0x04},                          // ZIP
     };
 
     private static final String[] EXTS = {
-        ".jpg", ".png", ".db", ".riff", ".mkv", ".flac", ".mp3", ".xml", ".zip",
+        ".jpg", ".png", ".db", ".riff", ".mkv", ".flac", ".mp3", ".ogg", ".xml", ".zip",
     };
 
     /** Bitraten in kBit/s, Index = Bitratenfeld. */
