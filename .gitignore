@@ -1,0 +1,15 @@
+# Build-Artefakte
+out/
+dist/
+manifest/
+*.class
+*.jar
+
+# Python
+__pycache__/
+*.pyc
+
+# IDE
+.idea/
+.vscode/
+*.iml
