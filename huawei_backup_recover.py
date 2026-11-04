@@ -66,6 +66,9 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 GCM_TAG_LEN = 16
+# Laenge der GCM-Nonce fuer den bkey-Schritt: 16 Byte (am echten
+# Backup verifiziert). Mit 12 Byte schlaegt der GCM-Tag fehl.
+BKEY_NONCE_LEN = 16
 PBKDF2_ITER_BKEY = 10000     # Schema A: Passwort -> K
 PBKDF2_ITER_FILE = 5000      # Schema A: bkey -> file_key
 PBKDF2_ITER_V13 = 5000       # Schema B: Passwort -> aes_key
@@ -116,55 +119,78 @@ def get_password() -> str:
 # Strukturierte XML-Auswertung
 # ---------------------------------------------------------------------------
 
-def parse_info_xml(xml_path: Path) -> dict:
-    """Strukturiert auswerten. Faengt kaputtes XML ab und faellt auf die
-    Rohtext-Suche zurueck.
+def _decode_index(raw: bytes) -> str:
+    """UTF-8, UTF-16LE/BE (mit BOM) - der Index kann in jeder davon
+    vorliegen."""
+    if len(raw) >= 2:
+        if raw[0] == 0xFF and raw[1] == 0xFE:
+            return raw.decode("utf-16-le", errors="ignore")
+        if raw[0] == 0xFE and raw[1] == 0xFF:
+            return raw.decode("utf-16-be", errors="ignore")
+    return raw.decode("utf-8", errors="ignore")
 
-    Index-Dateien duerfen UTF-8 oder UTF-16 (mit BOM) sein - beides wird
-    versucht."""
+
+_ROW_RE = re.compile(r"<row\s+table=\"([^\"]*)\"[^>]*>(.*?)</row>", re.S)
+_COL_RE = re.compile(r"<column\s+name=\"([^\"]*)\"[^>]*>(.*?)</column>", re.S)
+_VALUE_RE = re.compile(r"<value\s+([^>]*?)/?>")
+_ATTR_RE = re.compile(r"(String|Integer|Long|Boolean)=\"([^\"]*)\"")
+
+
+def _parse_columns(block: str) -> dict:
+    """Liest alle <column name="X"><value .../> aus einem Block."""
+    cols: dict[str, str] = {}
+    for name, body in _COL_RE.findall(block):
+        vm = _VALUE_RE.search(body)
+        if not vm:
+            continue
+        am = _ATTR_RE.search(vm.group(1))
+        if am:
+            cols[name] = am.group(2)
+    return cols
+
+
+def parse_info_xml(xml_path: Path) -> dict:
+    """Strukturiert auswerten - auch wenn das XML abgeschnitten ist.
+
+    Ein abgebrochenes Backup endet mitten in einem Attribut. Ein
+    strenger XML-Parser liefert dann gar nichts mehr, obwohl die
+    vollstaendigen Zeilen davor vollstaendig lesbar sind. Deshalb wird
+    der Index mit einem lockeren Zeilen-Parser ausgewertet: pro
+    <row table="...">...</row> ein Block, unabhaengig davon, ob die
+    Gesamtdokumentstruktur noch wohlgeformt ist.
+
+    Wichtig: das fuehrt beim abgeschnittenen Index zu Werten, die
+    vollstaendig sind - ein abgeschnittener encMsgV3 bleibt abgeschnitten
+    und wird ueber die Rohtext-Rettung (salvage_truncated) gefuellt."""
     modules: dict[str, dict] = {}
     e_pbk = pwkey = None
     xml_ok = False
 
-    root = None
-    last_err = None
-    for encoding in ("utf-8", "utf-16"):
-        try:
-            text = xml_path.read_bytes().decode(encoding)
-            root = ET.fromstring(text)
-            break
-        except (UnicodeDecodeError, ET.ParseError, OSError) as exc:
-            last_err = exc
-            continue
-
-    if root is None:
-        print("  XML nicht lesbar/wohlgeformt (%s) -> Rohtext-Rettung" % last_err)
+    try:
+        raw = xml_path.read_bytes()
+    except OSError:
         return {"modules": {}, "e_perbackupkey": None, "pwkey_salt": None,
                 "xml_ok": False}
 
-    for row in root.iter("row"):
-        table = row.get("table", "")
-        cols: dict[str, str] = {}
-        for col in row.findall("column"):
-            val_el = col.find("value")
-            if val_el is None:
-                continue
-            for attr in ("String", "Integer", "Long", "Boolean"):
-                v = val_el.get(attr)
-                if v is not None:
-                    cols[col.get("name", "")] = v
-                    break
+    text = _decode_index(raw)
+
+    for table, block in _ROW_RE.findall(text):
+        cols = _parse_columns(block)
         if table == "BackupFilesTypeInfo":
-            e_pbk = cols.get("e_perbackupkey")
-            pwkey = cols.get("pwkey_salt")
+            e_pbk = e_pbk or cols.get("e_perbackupkey")
+            pwkey = pwkey or cols.get("pwkey_salt")
         elif table in MODULE_TABLES:
             name = cols.get("name")
-            if name:
-                modules[name.strip()] = {
+            if name and name.strip():
+                modules.setdefault(name.strip(), {
                     "encMsgV3": (cols.get("encMsgV3") or "").strip(),
                     "checkMsgV3": (cols.get("checkMsgV3") or "").strip(),
-                }
-    xml_ok = True
+                })
+    if _ROW_RE.search(text):
+        xml_ok = True
+
+    if not xml_ok:
+        print("  XML nicht lesbar/wohlgeformt -> Rohtext-Rettung")
 
     return {
         "modules": modules,
@@ -321,7 +347,12 @@ def derive_bkey(password: str, e_perbackupkey_hex: str, pwkey_salt_hex: str):
         raise ValueError("pwkey_salt/e_perbackupkey zu kurz")
 
     key_salt = pw_salt[:16]
-    nonce = pw_salt[16:16 + 12] if len(pw_salt) >= 28 else pw_salt[16:]
+    # WICHTIG: die GCM-Nonce des bkey-Schritts ist 16 Byte lang
+    # (pwkey_salt[16:32]). Mit 12 Byte schlaegt der GCM-Tag fehl und das
+    # Passwort wird faelschlich als falsch gemeldet. Am echten Backup
+    # verifiziert (siehe docs/RECOVERY-NOTES.md).
+    nonce = pw_salt[16:16 + BKEY_NONCE_LEN] if len(pw_salt) >= 16 + BKEY_NONCE_LEN \
+        else pw_salt[16:]
     ct = epbk[:32]
     tag = epbk[32:48] if len(epbk) >= 48 else b""
 

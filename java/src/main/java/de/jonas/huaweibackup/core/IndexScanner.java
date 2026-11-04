@@ -50,6 +50,18 @@ public final class IndexScanner {
             "info.xml", "cinfoset.dat", "backupinfo.ini", "index.xml",
             "backupinfo.xml", "readme.txt", "readme"));
 
+    /**
+     * Merkmale, an denen eine Index-Datei im Inhalt erkannt wird.
+     *
+     * <p>Damit wird ein Index auch dann gefunden, wenn der Dateiname
+     * durch eine Weitergabe veraendert wurde.
+     */
+    private static final List<String> INDEX_CONTENT_MARKERS = List.of(
+            "e_perbackupkey",
+            "pwkey_salt",
+            "BackupFilesTypeInfo",
+            "BackupFileModuleInfo");
+
     private static final Set<String> MODULE_TABLES = new LinkedHashSet<>(List.of(
             "BackupFileModuleInfo",
             "BackupFileModuleInfo_Media",
@@ -416,16 +428,60 @@ public final class IndexScanner {
         return sb.toString().getBytes(StandardCharsets.US_ASCII);
     }
 
-    /** Findet alle Index-Dateien im Backup. */
+    /**
+     * Findet alle Index-Dateien im Backup.
+     *
+     * <p>Wichtig: erkannt wird <b>nicht nur nach dem Dateinamen</b>, sondern
+     * auch nach dem <b>Inhalt</b>. Ein Backup, das ueber einen Chat oder ein
+     * Ticket weitergegeben wurde, verliert dabei haeufig den Originalnamen
+     * ({@code info.xml} wird zu {@code input-info---<uuid>.xml}). Nach dem
+     * Dateinamen alone erkannt zu werden wuerde den Index komplett
+     * uebersehen - und damit auch {@code e_perbackupkey} und
+     * {@code pwkey_salt}, ohne die gar kein Schluessel ableitbar ist.
+     *
+     * <p>Der Inhaltstest erkennt eine Index-Datei an typischen Merkmalen:
+     * einer {@code <row table="BackupFilesTypeInfo">}-Zeile, einer
+     * {@code e_perbackupkey}-Spalte oder eines der Modul-Tabellen-Namen.
+     */
     public static List<Path> findIndexFiles(Path root) throws IOException {
         List<Path> out = new ArrayList<>();
         for (Path p : listFiles(root)) {
             String name = p.getFileName().toString().toLowerCase(Locale.ROOT);
             if (INDEX_NAMES.contains(name)) {
                 out.add(p);
+                continue;
+            }
+            if (looksLikeIndexContent(p)) {
+                out.add(p);
             }
         }
         return out;
+    }
+
+    /**
+     * Prueft, ob eine Datei an ihrem Inhalt als Backup-Index erkennbar ist.
+     *
+     * <p>Geprueft wird nur das Dateianfangsfenster - ein Index steht immer
+     * am Anfang einer Datei.
+     */
+    private static boolean looksLikeIndexContent(Path p) {
+        try {
+            long size = Files.size(p);
+            if (size < 32 || size > MAX_INDEX_BYTES) {
+                return false;
+            }
+            byte[] raw = readLimited(p, Math.min(size, 64 * 1024));
+            if (raw == null || raw.length < 32) {
+                return false;
+            }
+            String text = decodeXml(raw);
+            if (text == null) {
+                return false;
+            }
+            return INDEX_CONTENT_MARKERS.stream().anyMatch(text::contains);
+        } catch (IOException e) {
+            return false;
+        }
     }
 
     /** Listet alle Dateien unterhalb von {@code root}. */
