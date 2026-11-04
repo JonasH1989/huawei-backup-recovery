@@ -115,6 +115,27 @@ public final class Crypto {
         return new byte[][]{fileKey, iv};
     }
 
+    /**
+     * Media-Key: {@code SHA256(bkey)[0:16]} - AES-128.
+     *
+     * <p>Mediendateien werden nicht ueber {@code encMsgV3} abgeleitet,
+     * sondern ueber den bkey direkt. Der Key ist der erste Teil des
+     * SHA256-Hashs, die IV kommt pro Datei aus der Multimedia-XML
+     * (siehe {@link MediaIndex}).
+     *
+     * <p>Referenz: {@code RealityNet/kobackupdec}, Feld
+     * {@code _bkey_sha256 = SHA256.new(self._bkey).digest()[:16]}.
+     */
+    public static byte[] deriveMediaKey(String bkey) {
+        try {
+            byte[] digest = MessageDigest.getInstance("SHA-256")
+                    .digest(bkey.getBytes(StandardCharsets.UTF_8));
+            return Arrays.copyOf(digest, 16);
+        } catch (Exception e) {
+            throw new IllegalStateException("SHA-256 nicht verfuegbar", e);
+        }
+    }
+
     /** Schema B: (aes_key, nonce) fuer ein Modul. */
     public static byte[][] deriveKeyB(String password, byte[] encMsgV3) {
         byte[] seed = Arrays.copyOfRange(encMsgV3, 0, 32);

@@ -36,14 +36,45 @@ public final class TestBackupBuilder {
     }
 
     /** Die Testinhalte - als relative Pfade. */
-    public static Map<String, byte[]> payloads() {
+    public static Map<String, byte[]> payloads() throws IOException {
         Map<String, byte[]> map = new LinkedHashMap<>();
         map.put("photo/DCIM/IMG_0001.jpg", jpg(3000));
         map.put("photo/DCIM/IMG_0002.jpg", jpg(3000));
         map.put("photo/DCIM/IMG_0003.png", png(2000));
         map.put("video/Movies/VID_0001.mp4", mp4(4000));
         map.put("video/Movies/VID_0002.mp4", mp4(4000));
+        // MP3 OHNE ID3-Tag - so speichert Huawei Sprachnachrichten.
+        // Der Test stellt sicher, dass die MPEG-Frame-Erkennung
+        // greift und nicht nur die ID3-Signatur.
+        map.put("soundrecorder/AUD-20261026-WA0001.mp3", mp3Frames(6000));
         return map;
+    }
+
+    /**
+     * Baut eine MP3-Datei aus echten MPEG-Frames (ohne ID3-Tag).
+     *
+     * <p>MPEG-1 Layer III, 128 kBit/s, 44,1 kHz, kein Padding.
+     * Frame-Laenge = 144 * 128000 / 44100 = 417 Byte.
+     */
+    private static byte[] mp3Frames(int n) throws IOException {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        // Frame-Header: 0xFF 0xFB (MPEG1, Layer III, kein CRC),
+        // 0x90 (Bitrate 128, Samplerate 44100), 0x00 (Kanal Joint Stereo)
+        byte[] header = new byte[]{(byte) 0xff, (byte) 0xfb, (byte) 0x90, (byte) 0x00};
+        byte[] payload = "MP3DATA".repeat(n / 7).getBytes(StandardCharsets.US_ASCII);
+        int pos = 0;
+        while (pos < payload.length) {
+            out.writeBytes(header);
+            int take = Math.min(417 - header.length, payload.length - pos);
+            out.write(payload, pos, take);
+            pos += take;
+            // Frame auffuellen, damit die Laenge exakt 417 Byte betraegt.
+            int written = header.length + take;
+            if (written < 417) {
+                out.write(new byte[417 - written]);
+            }
+        }
+        return out.toByteArray();
     }
 
     private static byte[] jpg(int n) {
@@ -206,7 +237,7 @@ public final class TestBackupBuilder {
     }
 
     /** Signatur-Erkennung muss mit den Testdaten uebereinstimmen. */
-    public static void checkSignatures() {
+    public static void checkSignatures() throws IOException {
         for (Map.Entry<String, byte[]> e : payloads().entrySet()) {
             String detected = Signatures.detect(e.getValue());
             String expected = e.getKey().substring(e.getKey().lastIndexOf('.'));

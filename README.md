@@ -334,3 +334,64 @@ Die Audioaufnahme aus dem Ordner `soundrecorder` ist mit einem eigenen
 Verfahren verschluesselt, das weder Schema A noch Schema B entspricht.
 Sie bleibt vorerst unentschluesselt. Die uebrigen Module (`sms`,
 `calllog`, `Memo`) werden korrekt entschluesselt.
+
+## Version 1.2.0 - Tiefensuche und MP3-Erkennung
+
+### Warum die WhatsApp-Sprachnachricht nicht verschluesselt wurde
+
+Der Dateiname `AUD-20261026-WA0001---a65c1068-....mp3` stammt aus dem
+Chatverlauf (WA = WhatsApp). Die Datei liess sich mit **401.506
+Kombinationen** aus Schluessel x IV x Offset x Verfahren nicht
+entschluesseln.
+
+Der Grund ist nicht das Verfahren, sondern der **Index**: die
+`info.xml` ist bei 8192 Byte abgeschnitten, und die Indexzeile des
+Moduls fehlt. Ohne `encMsgV3` gibt es keinen Schluessel - unabhaengig
+vom Passwort.
+
+**Belegt** ueber das `checkMsgV3`-Orakel (HMAC-SHA256 ueber die
+verschluesselte Datei, Key = `PBKDF2(bkey, checkMsgV3[32:64], 5000)`):
+`calllog.db` matcht exakt, die MP3 matcht **kein** Modul.
+
+### Die Tiefensuche (Neu)
+
+Der Wert fehlt nicht im Backup - er steht nur nicht an der Stelle, an
+der er in der `info.xml` stehen wuerde. Deshalb sucht das Tool jetzt
+das **gesamte Backup** nach Index-Bloecken:
+
+- blockweises Lesen (1 MB), Speicherbedarf bleibt konstant
+- ueberlappende Fenster (4 KB), damit kein Wert zerschnitten wird
+- gesucht werden nur Hex-Runs ab 96 Zeichen (48 Byte) - das sind
+  genau die Kandidaten fuer `encMsgV3` und `checkMsgV3`
+- grosse Archivteile werden am Anfang **und** am Ende gelesen
+
+Die Suche laeuft **vor** der Kandidatenbildung, damit die gefundenen
+Werte als Salts verwendet werden.
+
+### MP3-Erkennung repariert
+
+Bisher erkannte das Tool nur MP3 mit ID3-Tag. Huawei-Sprachnachrichten
+haben oft **kein** ID3 - sie beginnen direkt mit dem MPEG-Frame-Sync.
+
+Die Erkennung prueft jetzt eine **Kette von mindestens drei
+aufeinanderfolgenden Frames** an den berechneten Positionen. Das ist
+notig, weil `0xFFEx` in Zufallsdaten alle ~5.600 Byte auftritt - ein
+einzelner Sync waere in einer 4-KB-Probe ein haeufiger Fehlalarm.
+Nach der Umstellung: **0 Falsch-Positive** in 260 KB Zufallsdaten.
+
+### Media-Weg (fuer Backup-Varianten mit Multimedia-XML)
+
+Mediendateien werden in manchen Backup-Versionen nicht ueber
+`encMsgV3` abgeleitet, sondern ueber eine **eigene IV pro Datei** aus
+einer `<Multimedia>`-XML:
+
+```xml
+<Multimedia><File><Path>/Sounds/AUD-....mp3</Path><Iv>HEX</Iv></File></Multimedia>
+```
+
+- Key: `SHA256(bkey)[0:16]` (AES-128)
+- Modus: AES-256-CTR, IV = der `<Iv>`-Wert
+
+Das Tool sucht diese XML jetzt selbst. Liegt sie nicht vor, bleibt die
+Datei unentschluesselbar - die IV laesst sich nicht aus der Datei
+ableiten.

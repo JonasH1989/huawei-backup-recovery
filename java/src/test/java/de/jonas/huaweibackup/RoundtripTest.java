@@ -101,7 +101,7 @@ public final class RoundtripTest {
             String stem = e.getKey().substring(0, e.getKey().lastIndexOf('.'));
 
             Path found = null;
-            for (String ext : new String[]{".jpg", ".png", ".mp4", ".db", ".xml", ".zip"}) {
+            for (String ext : new String[]{".jpg", ".png", ".mp4", ".mp3", ".db", ".xml", ".zip"}) {
                 Path candidate = find(output, baseName(stem) + ext);
                 if (candidate != null) {
                     found = candidate;

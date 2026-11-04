@@ -72,6 +72,18 @@ public final class RecoveryEngine {
     private final String password;
     private final Listener listener;
 
+    /** Media-Index mit den pro Datei hinterlegten IVs. */
+    private MediaIndex mediaIndex = new MediaIndex();
+
+    /**
+     * Soll das gesamte Backup nach Index-Bloecken durchsucht werden?
+     *
+     * <p>Bei einem abgebrochenen {@code info.xml} fehlt die Indexzeile
+     * des betroffenen Moduls. Nur eine Suche durch das ganze Backup
+     * kann den fehlenden {@code encMsgV3} noch finden.
+     */
+    private boolean deepSearch = true;
+
     public RecoveryEngine(Path backupRoot, Path outputRoot, String password,
                           Listener listener) {
         this.backupRoot = backupRoot;
@@ -103,7 +115,52 @@ public final class RecoveryEngine {
         message("  e_perbackupkey: " + (scan.ePerBackupKey != null ? "ja" : "NEIN")
                 + " | pwkey_salt: " + (scan.pwKeySalt != null ? "ja" : "NEIN"));
 
+        // --- Media-Index (eigene IV pro Mediendatei) --------------------
+        message("=== Media-Index ===");
+        try {
+            mediaIndex = MediaIndex.scan(backupRoot);
+            message("  Multimedia-XML gefunden: " + mediaIndex.sourceFiles().size()
+                    + " | IVs: " + mediaIndex.size());
+            for (String src : mediaIndex.sourceFiles()) {
+                message("    " + src);
+            }
+        } catch (IOException e) {
+            message("  Media-Index nicht lesbar: " + e.getMessage());
+        }
+
+        // --- Tiefensuche nach fehlenden Index-Bloecken -------------------
+        // Die info.xml kann abgeschnitten sein. Dann fehlt die
+        // Indexzeile eines Moduls - und damit sein encMsgV3. Der Wert
+        // kann aber an anderer Stelle im Backup liegen. Deshalb wird
+        // das ganze Backup blockweise nach Hex-Bloecken durchsucht.
+        if (deepSearch) {
+            message("=== Tiefensuche nach Index-Bloecken ===");
+            HexBlobScanner deep = new HexBlobScanner();
+            try {
+                HexBlobScanner.Result deepResult = deep.scan(backupRoot,
+                        new java.util.LinkedHashSet<>(), null);
+                int added = 0;
+                for (String blob : deepResult.blobs) {
+                    if (scan.blobPool.stream().noneMatch(b -> b.equalsIgnoreCase(blob))) {
+                        scan.blobPool.add(blob);
+                        added++;
+                    }
+                }
+                message(String.format("  %d Dateien durchsucht, %.1f MB gelesen, "
+                                + "%d Bloecke, davon %d neu",
+                        deepResult.filesScanned,
+                        deepResult.bytesScanned / (1024.0 * 1024.0),
+                        deepResult.blobs.size(), added));
+            } catch (IOException e) {
+                message("  Tiefensuche fehlgeschlagen: " + e.getMessage());
+            }
+        }
+
         // --- Schluessel-Kandidaten --------------------------------------
+        // WICHTIG: das kommt NACH der Tiefensuche. Die dort gefundenen
+        // Bloecke koennen die fehlenden encMsgV3-Werte der abgeschnittenen
+        // info.xml sein - ohne sie ist das betroffene Modul nicht
+        // entschluesselbar.
         CandidateBuilder builder = new CandidateBuilder();
         boolean[] passwordOk = {true};
         List<KeyCandidate> candidates = builder.build(password, scan, passwordOk);
@@ -122,6 +179,18 @@ public final class RecoveryEngine {
             message("  ein anderes Schema. Es werden trotzdem alle Kandidaten");
             message("  durchprobiert - der Klartext kann auch ohne passendes");
             message("  Tag stimmen.");
+        }
+
+        // Der bkey wird auch fuer den Media-Key gebraucht
+        // (SHA256(bkey)[0:16]).
+        if (scan.ePerBackupKey != null && scan.pwKeySalt != null) {
+            try {
+                setBkey(Crypto.deriveBkey(password,
+                        CandidateBuilder.hexToBytes(scan.ePerBackupKey),
+                        CandidateBuilder.hexToBytes(scan.pwKeySalt)));
+            } catch (Exception e) {
+                message("  bkey fuer Media-Key nicht ableitbar: " + e.getMessage());
+            }
         }
 
         // --- Nutzdaten sammeln ------------------------------------------
@@ -167,6 +236,15 @@ public final class RecoveryEngine {
 
         // Kandidaten mit passendem Modul zuerst, danach der Rest.
         List<KeyCandidate> ordered = orderCandidates(p, candidates);
+
+        // Media-Kandidat: eigene IV aus der Multimedia-XML, Key =
+        // SHA256(bkey)[0:16]. Der muss VOR den Modul-Kandidaten
+        // probiert werden, weil eine Mediendatei zu keinem Modul
+        // gehoert und sonst nie getroffen wuerde.
+        KeyCandidate mediaCandidate = buildMediaCandidate(p);
+        if (mediaCandidate != null) {
+            ordered.add(0, mediaCandidate);
+        }
 
         for (KeyCandidate candidate : ordered) {
             boolean isB = "B".equals(candidate.schema());
@@ -269,6 +347,55 @@ public final class RecoveryEngine {
         } catch (IOException e) {
             return false;
         }
+    }
+
+    /**
+     * Baut den Media-Kandidaten fuer eine Datei.
+     *
+     * <p>Mediendateien (Audio/Foto/Video) werden nicht ueber
+     * {@code encMsgV3} abgeleitet, sondern ueber:
+     * <ul>
+     *   <li>Key = {@code SHA256(bkey)[0:16]} (AES-128)</li>
+     *   <li>IV  = die Datei eigene IV aus der Multimedia-XML</li>
+     * </ul>
+     *
+     * <p>Die IV fehlt, wenn die Multimedia-XML nicht im Backup liegt -
+     * dann ist die Datei nicht entschluesselbar.
+     *
+     * @return der Kandidat oder null, wenn keine IV vorliegt
+     */
+    private KeyCandidate buildMediaCandidate(Path p) {
+        if (mediaIndex == null || mediaIndex.size() == 0) {
+            return null;
+        }
+        String ivHex = mediaIndex.ivFor(p, backupRoot);
+        if (ivHex == null) {
+            return null;
+        }
+        try {
+            byte[] iv = CandidateBuilder.hexToBytes(ivHex);
+            if (iv.length < 16) {
+                return null;
+            }
+            // Der bkey wird aus Passwort + e_perbackupkey/pwkey_salt
+            // abgeleitet. Ohne diese Werte gibt es keinen Media-Key.
+            String bkey = cachedBkey;
+            if (bkey == null) {
+                return null;
+            }
+            byte[] key = Crypto.deriveMediaKey(bkey);
+            return new KeyCandidate("M(Media)", key, iv, null);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /** Der aus dem Scan gespeicherte bkey (wird im Lauf gesetzt). */
+    private String cachedBkey;
+
+    /** Setzt den bkey nach der Index-Auswertung. */
+    private void setBkey(String bkey) {
+        this.cachedBkey = bkey;
     }
 
     /**

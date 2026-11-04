@@ -51,9 +51,15 @@ public final class KeyCandidate {
         return module;
     }
 
-    /** Schema des Kandidaten: "A" oder "B". */
+    /** Schema des Kandidaten: "A", "B" oder "M" (Media). */
     public String schema() {
-        return label.startsWith("B") ? "B" : "A";
+        if (label.startsWith("B")) {
+            return "B";
+        }
+        if (label.startsWith("M")) {
+            return "M";
+        }
+        return "A";
     }
 
     @Override
