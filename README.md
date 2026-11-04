@@ -4,9 +4,24 @@ Werkzeug, um Bilder/Videos aus einem **unvollständigen** Huawei-Backup
 zurückzugewinnen, bei dem die Index-Datei (`info.xml`) durch einen Abbruch
 mitten im Backup beschädigt ist.
 
+Zwei Auslieferungsformen, beide aus derselben fachlichen Basis:
+
+| | Java-Desktop-App | Python-CLI |
+|---|---|---|
+| **Ziel** | Lokal auf Jonas' Rechner starten | Server / Skript / Automatisierung |
+| **Oberfläche** | Swing-GUI mit Pfad, Passwort, Fortschritt | Kommandozeile |
+| **Plattformen** | Windows + Linux (via `jpackage`) | überall mit Python 3 + pycryptodome |
+| **Start** | `build.sh package` → startbares Programm | `python3 huawei_backup_recover.py …` |
+
+Die rechenintensive Arbeit läuft in **beiden** Fällen lokal auf dem
+Rechner, der das Backup liest. Kein Netzlaufwerk, kein WebDAV, kein
+Nextcloud – siehe [Warum nicht Nextcloud](#warum-nicht-nextcloud).
+
+---
+
 ## Das Problem
 
-Beim Backup auf dem Gerät (HiSuite / „Sichern auf USB-Stick“) bricht der
+Beim Backup auf dem Gerät (HiSuite / „Sichern auf USB-Stick") bricht der
 Vorgang ab. Danach gilt:
 
 - Bilder/Videos liegen verschlüsselt auf dem Stick, sind aber **nicht
@@ -33,7 +48,7 @@ Passwort und Salz. Das ist die wichtigste Rettungschance: Selbst wenn die
 Index-Datei nur teilweise beschädigt ist, genügt das Salz eines einzelnen
 Moduls.
 
-### Die drei Rettungswege des Tools
+### Die drei Rettungswege
 
 1. **Strukturierte Auswertung** – `info.xml`, `cinfoset.dat`,
    `backupinfo.ini` werden geparst (UTF-8 *und* UTF-16).
@@ -49,7 +64,57 @@ Moduls.
 Punkt 3 ist der Kern: **Ordnerstruktur und Index-Vollständigkeit sind
 nicht nötig.** Was die Signaturprüfung besteht, ist gültiger Klartext.
 
-## Benutzung
+---
+
+## Die grafische Oberfläche (Java)
+
+![Fenster](docs/screenshot-beschreibung.md)
+
+Bedienung:
+
+1. **Backup-Pfad** eintragen oder über „Backup wählen" auswählen
+2. **Passwort** eintragen (maskiert)
+3. **Ausgabe-Pfad** eintragen oder auswählen
+4. **Start** drücken
+
+Danach zeigt das Fenster:
+
+- ein **Protokoll** mit dem kompletten Lauf (Index-Auswertung, Kandidaten,
+  Einzelmeldungen)
+- eine **Ergebnisliste** mit `OK` / `FEHL` je Datei, erkanntem Dateityp und
+  dem Marker `[authentifiziert]` bzw. `[unvollständig]`
+- eine **Fortschrittsanzeige** (`n / gesamt`)
+- **Fehlermeldungen** als Dialog, wenn nichts entschlüsselt werden konnte
+
+Der Lauf läuft im Hintergrund, das Fenster bleibt bedienbar. Das Passwort
+wird nach dem Start aus dem Feld entfernt.
+
+### Bauen
+
+```bash
+# JDK 21 bereitstellen (falls nicht vorhanden)
+export JAVA_HOME=~/opt/jdk-21.0.13+9
+
+cd java
+./build.sh test        # kompilieren + Roundtrip-Test
+./build.sh package     # + startbares Linux-Programm in dist/
+./build.sh package windows   # Windows-Paket (auf Windows-Rechner ausführen)
+```
+
+`build.sh package` erzeugt mit `jpackage` ein startbares Programm inklusive
+eigener Java-Laufzeit – **kein Java muss auf Jonas' Rechner installiert
+sein**.
+
+### Ausführen ohne Paketierung
+
+```bash
+./build.sh build
+java -cp out de.jonas.huaweibackup.ui.RecoveryWindow
+```
+
+---
+
+## Die Kommandozeilen-Variante (Python)
 
 ```bash
 pip install pycryptodome
@@ -58,14 +123,14 @@ pip install pycryptodome
 python3 huawei_backup_recover.py --inspect /pfad/zum/backup
 
 # 2) Entschüsselung
-export HUAWEI_BACKUP_PASSWORD='dein-passwort'
+export HUAWEI_BACKUP_PASSWORD='…'
 python3 huawei_backup_recover.py --recover /pfad/zum/backup --out /pfad/zum/ausgabe
 ```
 
 Ohne `HUAWEI_BACKUP_PASSWORD` wird das Passwort interaktiv abgefragt
 (dann landet es nicht in der Shell-History).
 
-### Ausgabe
+Ausgabe:
 
 ```
   [1/5] IMG_0002.jpg   -> .jpg (B) [authentifiziert]
@@ -75,13 +140,24 @@ Ohne `HUAWEI_BACKUP_PASSWORD` wird das Passwort interaktiv abgefragt
   entschluesselt: 5 | nicht entschluesselbar: 0
 ```
 
-Dateien landen unter `--out` mit erkanntem Dateityp. Bei Schema B wird
-zusätzlich der GCM-Tag geprüft:
+---
 
-- `[authentifiziert]` – Schlüssel und Datei sind nachweislich korrekt
-- `[Tag passt nicht …]` – der Klartext ist gültig, aber die Datei wurde
-  vermutlich durch den Abbruch verkürzt. **Die Datei wird trotzdem
-  gerettet**, weil der Klartext bis zum Abbruchpunkt korrekt ist.
+## Warum nicht Nextcloud
+
+Nutzdaten über Nextcloud oder WebDAV zu transportieren ist für große
+Dateimengen ausgeschlossen: viele kleine Dateien erzeugen beim Schreiben
+sofort einen Upload, das Bandbreitenlimit reißt, und ein WebDAV-Mount ist
+keine native Dateisystemebene – das System wird instabil.
+
+Ein WebDAV-Mount ist damit **kein** Ersatz für ein Netzlaufwerk. Wenn der
+Server die Daten später braucht, ist ein **Netzlaufwerk** (SMB/NFS) der
+richtige Weg.
+
+Konsequenz für die Architektur: Der rechenintensive Teil (Entschlüsseln)
+läuft **auf Jonas' Rechner**, nicht auf dem Server. Der Server liefert
+höchstens den Code.
+
+---
 
 ## Grenzen (ehrlich benannt)
 
@@ -96,17 +172,63 @@ zusätzlich der GCM-Tag geprüft:
   nicht erkannt. In dem Fall: Header-Dateien hexdumpen und mit dem
   Algorithmus aus `irsl/Huawei-Hisuite-KobackupCipherTool` abgleichen.
 
+---
+
 ## Getestet
 
-`make_test_backup.py` erzeugt synthetische Backups beider Schemata, je mit
-intaktem und mit **mitten im Attribut abgeschnittenem** Index. Der
-Roundtrip-Vergleich ist bytegenau:
+Der Roundtrip-Test erzeugt synthetische Backups beider Schemata, je mit
+intaktem und mit **mitten im Attribut abgeschnittenem** Index, stellt sie
+wieder her und vergleicht **bytegenau** mit dem Original. Ein Test, der nur
+prüft „die Datei öffnet sich", ist kein Test.
 
 ```
 schema_a             5 identisch, 0 abweichend
 schema_a_corrupt     5 identisch, 0 abweichend
 schema_b             5 identisch, 0 abweichend
 schema_b_corrupt     5 identisch, 0 abweichend
+```
+
+Der Test läuft in **beiden** Sprachen – Python (`make_test_backup.py` +
+`huawei_backup_recover.py`) und Java (`RoundtripTest`).
+
+```bash
+# Java
+cd java && ./build.sh test
+
+# Python
+python3 make_test_backup.py /tmp/hw_test
+python3 huawei_backup_recover.py --recover /tmp/hw_test/schema_b --out /tmp/hw_out
+```
+
+---
+
+## Projektstruktur
+
+```
+huawei-backup-recovery/
+├── README.md                       ← dieses Dokument
+├── huawei_backup_recover.py        ← Python-CLI
+├── make_test_backup.py             ← synthetische Backups (Python)
+├── docs/
+│   ├── ALGORITHMUS.md              ← die(reverse-engineerten) Verfahren
+│   └── GCM-IN-JAVA.md              ← gemessenes Provider-Verhalten
+└── java/
+    ├── build.sh                    ← Build + Test + jpackage
+    └── src/
+        ├── main/java/de/jonas/huaweibackup/
+        │   ├── core/
+        │   │   ├── Crypto.java           ← PBKDF2, AES-CTR, AES-GCM
+        │   │   ├── IndexScanner.java     ← Index-Auswertung + Rohtext-Rettung
+        │   │   ├── CandidateBuilder.java ← Schlüssel-Kandidaten
+        │   │   ├── KeyCandidate.java
+        │   │   ├── Signatures.java       ← Dateisignatur-Erkennung
+        │   │   ├── BadPasswordException.java
+        │   │   └── RecoveryEngine.java   ← der Lauf
+        │   └── ui/
+        │       └── RecoveryWindow.java   ← die grafische Oberfläche
+        └── test/java/de/jonas/huaweibackup/
+            ├── TestBackupBuilder.java
+            └── RoundtripTest.java
 ```
 
 ## Quellen der reverse-engineerten Algorithmen
