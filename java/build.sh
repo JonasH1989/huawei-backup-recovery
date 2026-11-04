@@ -55,44 +55,108 @@ test_roundtrip() {
   "$JAVA" -cp "$OUT" de.jonas.huaweibackup.RoundtripTest /tmp/hw_java_test
 }
 
-package_app() {
-  local target="${1:-linux}"
+# Staging-Verzeichnis: jpackage braucht die Haupt-JAR relativ zum
+# Eingabeverzeichnis und dort vorhanden. Ohne dieses Staging schlaegt
+# jpackage mit "Die Haupt-JAR-Datei ist im Eingabeverzeichnis nicht
+# vorhanden" fehl.
+stage() {
+  rm -rf staging
+  mkdir -p staging
+  cp -r "$OUT"/* staging/
+  "$JAR" --create --file "staging/$APP_NAME.jar" \
+    --main-class "$MAIN_CLASS" -C "$OUT" .
+}
+
+package_linux() {
   echo
-  echo "=== Paketieren fuer $target ==="
-  if [[ "$target" == "linux" ]]; then
-    "$JPACKAGE" \
-      --name "$APP_NAME" \
-      --app-version "$VERSION" \
-      --vendor "Jonas Hillmann" \
-      --description "Recovery fuer abgebrochene Huawei/Honor KoBackup-Backups" \
-      --input "$OUT" \
-      --main-jar "$APP_NAME.jar" \
-      --main-class "$MAIN_CLASS" \
-      --linux-app-name huawei-backup-recovery \
-      --linux-package-name huawei-backup-recovery \
-      --linux-deb-maintainer "jonas@example.com" \
-      --dest dist
-  elif [[ "$target" == "windows" ]]; then
-    # jpackage fuer Windows laeuft unter Linux nur mit cross-Toolchain.
-    # Empfehlung: auf einem Windows-Rechner ausfuehren.
-    "$JPACKAGE" \
-      --name "$APP_NAME" \
-      --app-version "$VERSION" \
-      --vendor "Jonas Hillmann" \
-      --description "Recovery fuer abgebrochene Huawei/Honor KoBackup-Backups" \
-      --input "$OUT" \
-      --main-jar "$APP_NAME.jar" \
-      --main-class "$MAIN_CLASS" \
-      --win-console \
-      --dest dist
-  fi
-  echo "Artefakte in dist/"
+  echo "=== Paketieren fuer Linux (app-image) ==="
+  rm -rf "dist/$APP_NAME"
+  stage
+  "$JPACKAGE" \
+    --name "$APP_NAME" \
+    --app-version "$VERSION" \
+    --vendor "Jonas Hillmann" \
+    --description "Recovery fuer abgebrochene Huawei/Honor KoBackup-Backups" \
+    --input staging \
+    --main-jar "$APP_NAME.jar" \
+    --main-class "$MAIN_CLASS" \
+    --type app-image \
+    --dest dist
+  echo "Startbar: dist/$APP_NAME/bin/$APP_NAME"
+}
+
+# Windows laeuft nicht ueber jpackage unter Linux (kein Cross-Toolchain).
+# Stattdessen: portable Temurin-JRE + JAR + start.bat. Die JRE bringt das
+# Programm ohne Java-Installation auf den Windows-Rechner.
+package_windows() {
+  echo
+  echo "=== Paketieren fuer Windows (portable JRE) ==="
+  local url="https://api.adoptium.net/v3/binary/latest/21/ga/windows/x64/jre/hotspot/normal/eclipse?project=jdk"
+  local tmp
+  tmp="$(mktemp -d)"
+  echo "JRE herunterladen (~49 MB) ..."
+  curl -sL -o "$tmp/jre.zip" "$url"
+  unzip -q -o "$tmp/jre.zip" -d "$tmp/jre"
+  local jre_dir
+  jre_dir="$(find "$tmp/jre" -maxdepth 1 -type d -name 'jdk-*' | head -1)"
+
+  rm -rf "dist-windows/$APP_NAME"
+  mkdir -p "dist-windows/$APP_NAME"
+  stage
+  cp "staging/$APP_NAME.jar" "dist-windows/$APP_NAME/"
+  cp -r "$jre_dir" "dist-windows/$APP_NAME/runtime"
+
+  cat > "dist-windows/$APP_NAME/start.bat" <<'EOF'
+@echo off
+REM Huawei Backup Recovery - Starter
+REM Enthaelt eine eigene Java-Laufzeit, Java muss nicht installiert sein.
+cd /d "%~dp0"
+set "JRE=%~dp0runtime"
+if exist "%JRE%\bin\javaw.exe" (
+    start "" "%JRE%\bin\javaw.exe" -jar "%~dp0Huawei-Backup-Recovery.jar"
+) else (
+    echo Java-Laufzeit nicht gefunden: %JRE%
+    pause
+)
+EOF
+
+  cat > "dist-windows/$APP_NAME/LIESMICH.txt" <<'EOF'
+Huawei Backup Recovery - Recovery abgebrochener Huawei/Honor KoBackup-Backups
+
+STARTEN:
+  start.bat doppelklicken (bzw. "Starten" im Explorer)
+
+Die eigene Java-Laufzeit liegt im Ordner "runtime" - es muss KEIN Java
+installiert sein. Der Ordner "runtime" darf nicht verschoben oder
+geloescht werden.
+
+Ablauf im Programm:
+  1. Pfad zum Backup eintragen (Ordner mit den verschluesselten Daten)
+  2. Passwort eingeben
+  3. "Start" druecken
+  4. Protokoll und Ergebnisliste im Fenster beobachten
+  5. Gerettete Dateien landen im Ausgabeordner
+
+WICHTIG: Das Original-Backup wird nur gelesen, nie veraendert.
+Das Ergebnis wird immer in einen separaten Ausgabeordner geschrieben.
+EOF
+
+  (cd dist-windows && zip -qr "../dist/$APP_NAME-windows-x64.zip" "$APP_NAME")
+  rm -rf "$tmp"
+  echo "Startbar: dist/$APP_NAME-windows-x64.zip"
 }
 
 case "${1:-all}" in
   build)   build ;;
   test)    build && test_roundtrip ;;
-  package) build && test_roundtrip && package_app "${2:-linux}" ;;
+  package)
+    build && test_roundtrip
+    case "${2:-linux}" in
+      linux)   package_linux ;;
+      windows) package_windows ;;
+      *)       echo "Unbekanntes Ziel: $2 (linux|windows)"; exit 1 ;;
+    esac
+    ;;
   all)     build && test_roundtrip ;;
   *)       echo "Unbekannter Aufruf: $1"; exit 1 ;;
 esac
