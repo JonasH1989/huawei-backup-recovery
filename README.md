@@ -89,21 +89,60 @@ Danach zeigt das Fenster:
 Der Lauf läuft im Hintergrund, das Fenster bleibt bedienbar. Das Passwort
 wird nach dem Start aus dem Feld entfernt.
 
-### Bauen
+### Installation (fertige Pakete)
+
+Die Pakete liegen als GitHub-Release bereit – **kein Java nötig**, die
+Java-Laufzeit ist jeweils enthalten:
+
+**Windows (x64)**
+
+1. [Huawei-Backup-Recovery-windows-x64.zip](https://github.com/JonasH1989/huawei-backup-recovery/releases/download/v1.0.0/Huawei-Backup-Recovery-windows-x64.zip) herunterladen
+2. Entpacken (z. B. nach `C:\Huawei-Backup-Recovery`)
+3. **`start.bat` doppelklicken**
+
+Der Ordner `runtime` enthält die eigene Java-Laufzeit und darf **nicht**
+verschoben oder gelöscht werden.
+
+**Linux (x64)**
+
+1. [Huawei-Backup-Recovery-linux-x64.tar.gz](https://github.com/JonasH1989/huawei-backup-recovery/releases/download/v1.0.0/Huawei-Backup-Recovery-linux-x64.tar.gz) herunterladen und entpacken
+2. Starten mit `./Huawei-Backup-Recovery/bin/Huawei-Backup-Recovery`
+
+**Universelles JAR** (für alle, die Java 21+ schon haben)
+
+[Huawei-Backup-Recovery.jar](https://github.com/JonasH1989/huawei-backup-recovery/releases/download/v1.0.0/Huawei-Backup-Recovery.jar)
+
+```bash
+java -jar Huawei-Backup-Recovery.jar
+```
+
+### Bedienung im Programm
+
+1. **Pfad zum Backup** eintragen – der Ordner mit den verschlüsselten Daten
+2. **Passwort** eingeben
+3. **„Start"** drücken
+4. Protokoll und Ergebnisliste (`OK` / `FEHL` je Datei, erkannter Dateityp)
+   im Fenster beobachten
+5. Gerettete Dateien landen im **Ausgabeordner**
+
+Das Original-Backup wird nur **gelesen**, nie verändert. Das Ergebnis landet
+immer in einem separaten Ausgabeordner.
+
+### Bauen (für Nachbauten)
 
 ```bash
 # JDK 21 bereitstellen (falls nicht vorhanden)
 export JAVA_HOME=~/opt/jdk-21.0.13+9
 
 cd java
-./build.sh test        # kompilieren + Roundtrip-Test
-./build.sh package     # + startbares Linux-Programm in dist/
-./build.sh package windows   # Windows-Paket (auf Windows-Rechner ausführen)
+./build.sh test               # kompilieren + Roundtrip-Test
+./build.sh package linux      # startbares Linux-Programm in dist/
+./build.sh package windows    # portables Windows-Paket (JRE + ZIP)
 ```
 
-`build.sh package` erzeugt mit `jpackage` ein startbares Programm inklusive
-eigener Java-Laufzeit – **kein Java muss auf Jonas' Rechner installiert
-sein**.
+`./build.sh package windows` legt eine portable Temurin-JRE 21 daneben – damit
+läuft das Programm auf Windows ohne Java-Installation. Ein echtes
+`jpackage --type exe` für Windows braucht einen Windows-Rechner.
 
 ### Ausführen ohne Paketierung
 
