@@ -69,6 +69,10 @@ public final class RoundtripTest {
                 backup, output, TestBackupBuilder.PASSWORD,
                 new RecoveryEngine.Listener() {
                     @Override
+                    public void onIndexProgress(int done, int total, String phase) {
+                    }
+
+                    @Override
                     public void onProgress(int done, int total) {
                     }
 

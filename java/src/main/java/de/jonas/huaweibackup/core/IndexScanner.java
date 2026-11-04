@@ -1,10 +1,12 @@
 package de.jonas.huaweibackup.core;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -29,9 +31,14 @@ import java.util.regex.Pattern;
  *       Kopie des Index an anderer Stelle kann intakt sein.</li>
  * </ol>
  *
+ * <p><b>Streaming:</b> bei einem 20-GB-Backup darf keine Datei
+ * vollstaendig in den Speicher. Die Index-Dateien werden begrenzt
+ * gelesen (sie sind klein), die Nutzdateien werden nur gestreift und
+ * nur bis zu einem begrenzten Fenster durchsucht.
+ *
  * <p>Index-Dateien koennen UTF-8 oder UTF-16 kodiert sein. Bei UTF-16
  * sind die Hex-Zeichen von Nullbytes durchsetzt, ein Regex auf den
- * Rohbytes greift nicht - deshalb wird zusätzlich dekodiert.
+ * Rohbytes greift nicht - deshalb wird zusaetzlich dekodiert.
  */
 public final class IndexScanner {
 
@@ -51,6 +58,20 @@ public final class IndexScanner {
     /** Hex-Run mit mindestens 64 Zeichen (32 Byte). */
     private static final Pattern HEX_RUN = Pattern.compile("[0-9a-fA-F]{16,}");
 
+    /** Maximale Groesse einer Index-Datei, die vollstaendig gelesen wird. */
+    private static final long MAX_INDEX_BYTES = 8L * 1024 * 1024;
+
+    /**
+     * Wie viele Byte einer Nicht-Index-Datei fuer die Rohtext-Suche
+     * gelesen werden. Bei einem 20-GB-Backup waere ein vollstaendiger
+     * Scan unmoeglich; die Hex-Bloecke liegen am Dateianfang oder
+     * innerhalb der ersten MB.
+     */
+    private static final long RAW_SCAN_WINDOW = 2L * 1024 * 1024;
+
+    /** Maximale Dateigroesse, die fuer die Rohtext-Suche beruecksichtigt wird. */
+    private static final long MAX_RAW_SCAN_FILE = 64L * 1024 * 1024;
+
     private final List<String> log = new ArrayList<>();
 
     public List<String> log() {
@@ -61,12 +82,20 @@ public final class IndexScanner {
     public static final class Result {
         /** Modulname -> encMsgV3 (Hex). */
         public final Map<String, String> modules = new LinkedHashMap<>();
+        /** Modulname -> Tabellen (z. B. {@code calls}). */
+        public final Map<String, String> moduleTables = new LinkedHashMap<>();
         /** e_perbackupkey (Hex) oder null. */
         public String ePerBackupKey;
         /** pwkey_salt (Hex) oder null. */
         public String pwKeySalt;
         /** Alle gefundenen Hex-Bloecke, dedupliziert, Reihenfolge stabil. */
         public final List<String> blobPool = new ArrayList<>();
+        /**
+         * Hex-Bloecke, die nachweislich KEIN Salt sind (e_perbackupkey,
+         * pwkey_salt, checkMsgV3, snHash ...). Sie wuerden als Salt
+         * falsche Schluessel ergeben.
+         */
+        public final List<String> nonSaltBlobs = new ArrayList<>();
         /** Wurde ein wohlgeformtes XML gelesen? */
         public boolean xmlOk;
     }
@@ -82,9 +111,19 @@ public final class IndexScanner {
         Set<String> seenBlobs = new LinkedHashSet<>();
 
         for (Path p : indexFiles) {
+            long size;
+            try {
+                size = Files.size(p);
+            } catch (IOException e) {
+                continue;
+            }
             log.add(String.format("  Index-Datei: %s (%d Byte)",
-                    p.getFileName(), Files.size(p)));
-            byte[] raw = Files.readAllBytes(p);
+                    p.getFileName(), size));
+
+            byte[] raw = readLimited(p, MAX_INDEX_BYTES);
+            if (raw == null) {
+                continue;
+            }
 
             if (looksLikeXml(p, raw)) {
                 parseXml(raw, result);
@@ -96,10 +135,19 @@ public final class IndexScanner {
                     result.blobPool.add(blob);
                 }
             }
+            // Abgeschnittene Hex-Werte: der fehlende Teil wird mit
+            // Nullen aufgefuellt. Ob der Kandidat taugt, entscheidet
+            // anschliessend die Signatur- bzw. GCM-Pruefung.
+            for (String blob : salvageTruncated(raw)) {
+                if (seenBlobs.add(blob.toLowerCase(Locale.ROOT))) {
+                    result.blobPool.add(blob);
+                }
+            }
         }
 
-        // Rohtext-Suche im GESAMTEN Backup
+        // Rohtext-Suche im GESAMTEN Backup - aber nur gestreift.
         int scanned = 0;
+        long bytesRead = 0;
         for (Path p : listFiles(root)) {
             if (indexFiles.contains(p)) {
                 continue;
@@ -110,16 +158,17 @@ public final class IndexScanner {
             } catch (IOException e) {
                 continue;
             }
-            if (size < 32 || size > 64L * 1024 * 1024) {
+            if (size < 32 || size > MAX_RAW_SCAN_FILE) {
                 continue;
             }
-            byte[] raw;
-            try {
-                raw = Files.readAllBytes(p);
-            } catch (IOException e) {
+            // Nur ein Fenster am Dateianfang lesen, nicht die ganze Datei.
+            long window = Math.min(size, RAW_SCAN_WINDOW);
+            byte[] raw = readLimited(p, window);
+            if (raw == null || raw.length < 32) {
                 continue;
             }
             scanned++;
+            bytesRead += raw.length;
             List<String> found = salvageHexBlobs(raw);
             if (!found.isEmpty()) {
                 log.add(String.format("  Weitere Hex-Bloecke in: %s (%d Treffer)",
@@ -132,9 +181,34 @@ public final class IndexScanner {
             }
         }
         if (scanned > 0) {
-            log.add(String.format("  Rohtext-Suche ueber %d weitere Dateien", scanned));
+            log.add(String.format("  Rohtext-Suche ueber %d Dateien (%d MB gelesen)",
+                    scanned, bytesRead / (1024 * 1024)));
         }
         return result;
+    }
+
+    /**
+     * Liest hoechstens {@code max} Byte am Dateianfang.
+     *
+     * <p>Der Index liegt am Anfang der Datei; ein Abbruch passiert
+     * typischerweise erst danach.
+     */
+    private static byte[] readLimited(Path p, long max) {
+        try (InputStream in = Files.newInputStream(p)) {
+            byte[] buf = new byte[(int) Math.min(max, Integer.MAX_VALUE)];
+            int total = 0;
+            int n;
+            while (total < buf.length
+                    && (n = in.read(buf, total, buf.length - total)) > 0) {
+                total += n;
+            }
+            if (total == buf.length) {
+                return buf;
+            }
+            return Arrays.copyOf(buf, total);
+        } catch (IOException e) {
+            return null;
+        }
     }
 
     private static boolean looksLikeXml(Path p, byte[] raw) {
@@ -182,11 +256,27 @@ public final class IndexScanner {
                 if (result.pwKeySalt == null) {
                     result.pwKeySalt = cols.get("pwkey_salt");
                 }
+                if (result.ePerBackupKey != null) {
+                    result.nonSaltBlobs.add(result.ePerBackupKey.trim());
+                }
+                if (result.pwKeySalt != null) {
+                    result.nonSaltBlobs.add(result.pwKeySalt.trim());
+                }
             } else if (MODULE_TABLES.contains(table)) {
                 String name = cols.get("name");
                 if (name != null && !name.isBlank()) {
-                    result.modules.putIfAbsent(name.trim(),
+                    String mod = name.trim();
+                    result.modules.putIfAbsent(mod,
                             cols.getOrDefault("encMsgV3", "").trim());
+                    String tables = cols.get("tables");
+                    if (tables != null && !tables.isBlank()) {
+                        result.moduleTables.putIfAbsent(mod, tables.trim());
+                    }
+                    // checkMsgV3 ist ein Pruefwert, KEIN Salt.
+                    String check = cols.get("checkMsgV3");
+                    if (check != null && !check.isBlank()) {
+                        result.nonSaltBlobs.add(check.trim());
+                    }
                 }
             }
         }
@@ -313,9 +403,6 @@ public final class IndexScanner {
 
     /**
      * Dekodiert UTF-16 und filtert Nicht-ASCII-Zeichen heraus.
-     *
-     * <p>So werden die eingestreuten Nullbytes zu echten Hex-Zeichen
-     * zusammengefuegt.
      */
     private static byte[] decodeUtf16(byte[] raw, java.nio.charset.Charset cs) {
         String s = new String(raw, cs);

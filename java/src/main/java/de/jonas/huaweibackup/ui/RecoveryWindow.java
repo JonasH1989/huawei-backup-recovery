@@ -206,6 +206,15 @@ public final class RecoveryWindow extends JFrame {
                                     }
 
                                     @Override
+                                    public void onIndexProgress(int done, int total, String phase) {
+                                        SwingUtilities.invokeLater(() -> {
+                                            progressBar.setMaximum(Math.max(total, 1));
+                                            progressBar.setValue(done);
+                                            progressBar.setString(phase + " " + done + " / " + total);
+                                        });
+                                    }
+
+                                    @Override
                                     public void onRecovered(String source, String target,
                                                             String extension, String schema,
                                                             boolean authenticated) {

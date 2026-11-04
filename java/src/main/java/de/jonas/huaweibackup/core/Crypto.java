@@ -1,9 +1,15 @@
 package de.jonas.huaweibackup.core;
 
-import javax.crypto.spec.GCMParameterSpec;
-import javax.crypto.spec.SecretKeySpec;
-import javax.crypto.Cipher;
 import javax.crypto.AEADBadTagException;
+import javax.crypto.Cipher;
+import javax.crypto.SecretKeyFactory;
+import javax.crypto.spec.GCMParameterSpec;
+import javax.crypto.spec.IvParameterSpec;
+import javax.crypto.spec.PBEKeySpec;
+import javax.crypto.spec.SecretKeySpec;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.util.Arrays;
@@ -12,12 +18,13 @@ import java.util.Arrays;
  * Krypto-Primitive fuer die Huawei-KoBackup-Recovery.
  *
  * <p>Zwei Schemata werden unterstuetzt (reverse-engineered aus der
- * KoBackup-/HiSuite-Implementierung):
+ * KoBackup-/HiSuite-Implementierung und an echten Backup-Daten
+ * verifiziert):
  *
  * <pre>
- * Schema A - KoBackup v10..v12 (AES-256-CTR)
+ * Schema A - KoBackup v10..v12 / HiSuite 10 (AES-256-CTR)
  *   K        = PBKDF2-HMAC-SHA256(passwort, pwkey_salt[:16], 10000, 32)
- *   bkey     = AES-256-GCM(K, nonce=pwkey_salt[16:28]).decrypt(e_perbackupkey[:32])
+ *   bkey     = AES-256-GCM(K, nonce=pwkey_salt[16:32]).decrypt(e_perbackupkey[:32])
  *              (e_perbackupkey[32:48] ist der GCM-Tag -&gt; Passwort-Pruefung)
  *   file_key = PBKDF2-HMAC-SHA256(bkey.encode(utf-8), encMsgV3[:32], 5000, 32)
  *   Datei    = AES-256-CTR(file_key, iv=encMsgV3[32:48])
@@ -27,9 +34,15 @@ import java.util.Arrays;
  *   Datei   = ciphertext || 16-Byte-GCM-Tag, nonce = encMsgV3[32:48]
  * </pre>
  *
- * <p><b>Wichtig fuer die Rettung:</b> Schema B braucht kein
- * {@code e_perbackupkey} - der Schluessel folgt direkt aus Passwort und
- * Salt. Damit reicht es, die {@code encMsgV3}-Bloecke zu bergen.
+ * <p><b>Wichtig (am echten Backup verifiziert):</b> die GCM-Nonce des
+ * bkey-Schritts ist <b>16 Byte</b> lang, also {@code pwkey_salt[16:32]}.
+ * Mit 12 Byte (wie in aelteren Beschreibungen) schlaegt der GCM-Tag
+ * fehl und das Passwort wird faelschlich als falsch gemeldet.
+ *
+ * <p><b>Kein eigener GCM-Prototyp.</b> Alle GCM-Rechenwege laufen ueber
+ * den JDK-Provider. Eine eigene GHASH-Implementierung wurde gegen den
+ * Provider geprueft und war nicht byte-identisch - sie wird deshalb
+ * nicht verwendet.
  */
 public final class Crypto {
 
@@ -37,6 +50,9 @@ public final class Crypto {
     public static final int PBKDF2_ITER_BKEY = 10_000;  // Schema A: Passwort -> K
     public static final int PBKDF2_ITER_FILE = 5_000;   // Schema A: bkey -> file_key
     public static final int PBKDF2_ITER_V13 = 5_000;    // Schema B: Passwort -> aes_key
+
+    /** Laenge der GCM-Nonce fuer den bkey-Schritt (verifiziert: 16). */
+    public static final int BKEY_NONCE_LEN = 16;
 
     private Crypto() {
     }
@@ -57,14 +73,13 @@ public final class Crypto {
     public static String deriveBkey(String password, byte[] ePerBackupKey, byte[] pwKeySalt)
             throws BadPasswordException {
 
-        if (pwKeySalt.length < 16 || ePerBackupKey.length < 32) {
+        if (pwKeySalt.length < 16 + BKEY_NONCE_LEN || ePerBackupKey.length < 32) {
             throw new IllegalArgumentException("pwkey_salt/e_perbackupkey zu kurz");
         }
 
         byte[] keySalt = Arrays.copyOfRange(pwKeySalt, 0, 16);
-        byte[] nonce = pwKeySalt.length >= 28
-                ? Arrays.copyOfRange(pwKeySalt, 16, 28)
-                : Arrays.copyOfRange(pwKeySalt, 16, pwKeySalt.length);
+        // 16-Byte-Nonce - am echten Backup verifiziert.
+        byte[] nonce = Arrays.copyOfRange(pwKeySalt, 16, 16 + BKEY_NONCE_LEN);
         byte[] ct = Arrays.copyOfRange(ePerBackupKey, 0, 32);
         byte[] tag = ePerBackupKey.length >= 48
                 ? Arrays.copyOfRange(ePerBackupKey, 32, 48)
@@ -119,18 +134,17 @@ public final class Crypto {
      */
     public static byte[] pbkdf2(byte[] password, byte[] salt, int iterations, int keyLen) {
         try {
-            javax.crypto.SecretKeyFactory f =
-                    javax.crypto.SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256");
+            SecretKeyFactory f = SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256");
             char[] chars = new String(password, StandardCharsets.UTF_8).toCharArray();
-            return f.generateSecret(new javax.crypto.spec.PBEKeySpec(
-                    chars, salt, iterations, keyLen * 8)).getEncoded();
+            return f.generateSecret(new PBEKeySpec(chars, salt, iterations, keyLen * 8))
+                    .getEncoded();
         } catch (Exception e) {
             throw new IllegalStateException("PBKDF2 fehlgeschlagen", e);
         }
     }
 
     // -----------------------------------------------------------------
-    // Entschluesselung
+    // Entschluesselung (einmalig, fuer kleine Dateien und Signaturproben)
     // -----------------------------------------------------------------
 
     /**
@@ -142,12 +156,9 @@ public final class Crypto {
      */
     public static byte[] decryptCtr(byte[] key, byte[] iv, byte[] data) {
         try {
-            byte[] counter = iv.length >= 16
-                    ? Arrays.copyOfRange(iv, 0, 16)
-                    : padded(iv, 16);
             Cipher cipher = Cipher.getInstance("AES/CTR/NoPadding");
             cipher.init(Cipher.DECRYPT_MODE, new SecretKeySpec(key, "AES"),
-                    new javax.crypto.spec.IvParameterSpec(counter));
+                    new IvParameterSpec(counter(iv)));
             return cipher.doFinal(data);
         } catch (Exception e) {
             return null;
@@ -157,17 +168,10 @@ public final class Crypto {
     /**
      * Schema B: AES-256-GCM, Tag wird abgetrennt.
      *
-     * <p>Der 16-Byte-Tag am Dateiende ist KEIN Chiffrat. Wird er
-     * mitentschluesselt, ist die Ausgabe 16 Byte zu lang und die Datei
-     * kaputt.
-     *
      * @param hasTag true, wenn {@code data} den Tag bereits enthaelt
      */
     public static byte[] decryptGcm(byte[] key, byte[] nonce, byte[] data, boolean hasTag) {
         try {
-            byte[] iv = nonce.length >= 16
-                    ? Arrays.copyOfRange(nonce, 0, 16)
-                    : padded(nonce, 16);
             byte[] ct = data;
             if (hasTag) {
                 if (data.length <= GCM_TAG_LEN) {
@@ -175,7 +179,7 @@ public final class Crypto {
                 }
                 ct = Arrays.copyOfRange(data, 0, data.length - GCM_TAG_LEN);
             }
-            return decryptGcmPlaintext(key, iv, ct);
+            return decryptGcmPlaintext(key, nonce, ct);
         } catch (Exception e) {
             return null;
         }
@@ -194,23 +198,13 @@ public final class Crypto {
      * Tag den Klartext und wirft {@code AEADBadTagException}. Deshalb
      * wird der Keystream hier ueber einen Umweg gewonnen: der Provider
      * verschluesselt einen Nullblock, das Ergebnis ist der Keystream
-     * selbst (XOR mit Null = Identitaet).
-     *
-     * <p>Damit muss das J0-Konstrukt nicht nachgebaut werden - der
-     * Provider erledigt es fuer alle IV-Laengen korrekt. Ein selbst
-     * gebautes GHASH waere hier fehleranfaellig; die Referenz-Datei
-     * {@code references/java-portierung-gcm.md} dokumentiert die
-     * Messung und die Sackgassen.
+     * selbst (XOR mit Null = Identitaet). Das J0-Konstrukt wird damit
+     * nicht nachgebaut - der Provider erledigt es fuer alle IV-Laengen
+     * korrekt.
      */
-    private static byte[] decryptGcmPlaintext(byte[] key, byte[] iv, byte[] ct) {
+    private static byte[] decryptGcmPlaintext(byte[] key, byte[] nonce, byte[] ct) {
         try {
-            // Keystream: Provider verschluesselt Nullen -> Ergebnis ist
-            // der Keystream (die ersten n Byte vor dem Tag).
-            Cipher stream = Cipher.getInstance("AES/GCM/NoPadding");
-            stream.init(Cipher.ENCRYPT_MODE, new SecretKeySpec(key, "AES"),
-                    new GCMParameterSpec(GCM_TAG_LEN * 8, iv));
-            byte[] keystream = stream.doFinal(new byte[ct.length]);
-
+            byte[] keystream = gcmKeystream(key, nonce, ct.length);
             byte[] out = new byte[ct.length];
             for (int i = 0; i < ct.length; i++) {
                 out[i] = (byte) (ct[i] ^ keystream[i]);
@@ -222,94 +216,30 @@ public final class Crypto {
     }
 
     /**
-     * J0-Konstrukt nach NIST SP 800-38D, Gleichung 7.
+     * Erzeugt {@code n} Byte Keystream fuer Schema B (GCM).
      *
-     * <pre>
-     * J0 = GHASH_H(IV || 0^(s+64) || [len(IV)]_64)
-     * </pre>
-     *
-     * <p>Die Laengenangaben in der Norm sind in <b>Bit</b>:
-     * {@code s = 128*ceil(len(IV)/128) - len(IV)}. Damit ist der
-     * Nullblock-Anhang {@code s/8 + 8} Byte (8 Byte Nullen plus der
-     * 64-Bit-Laengenwert), und die Gesamtlänge ist ein Vielfaches von
-     * 16 Byte.
-     *
-     * <p>Fuer ein 96-Bit-IV gilt die Vereinfachung
-     * {@code J0 = IV || 0^31 || 1}. KoBackup nutzt jedoch 16-Byte-Nonces -
-     * damit greift der GHASH-Fall.
+     * <p>Am Provider verifiziert: chunkweises {@code update()} liefert
+     * denselben Keystream wie der One-Shot-Aufruf. Wegen der internen
+     * Pufferung des Providers wird der Keystream in einem Puffer
+     * gesammelt und nur bei Bedarf weitergegeben.
      */
-    private static byte[] gcmJ0(byte[] h, byte[] iv) {
-        if (iv.length == 12) {
-            byte[] j0 = new byte[16];
-            System.arraycopy(iv, 0, j0, 0, 12);
-            j0[15] = 1;
-            return j0;
-        }
-        // s (in Bit) = 128*ceil(len*8/128) - len*8
-        long lenBits = (long) iv.length * 8L;
-        long sBits = 128L * ((lenBits + 127L) / 128L) - lenBits;
-        int sBytes = (int) (sBits / 8L);
-
-        // x = IV || 0^(s/8 + 8) || [len(IV)]_64
-        byte[] x = new byte[iv.length + sBytes + 8 + 8];
-        System.arraycopy(iv, 0, x, 0, iv.length);
-        // [len(IV)]_64 in Bit, big-endian
-        for (int i = 0; i < 8; i++) {
-            x[x.length - 1 - i] = (byte) (lenBits >>> (8 * i));
-        }
-        return ghash(h, x);
-    }
-
-    /** GHASH: Multiplikation in GF(2^128) mit R = 0xe1 || 0^120. */
-    private static byte[] ghash(byte[] h, byte[] x) {
-        byte[] y = new byte[16];
-        for (int off = 0; off + 16 <= x.length; off += 16) {
-            for (int i = 0; i < 16; i++) {
-                y[i] ^= x[off + i];
+    public static byte[] gcmKeystream(byte[] key, byte[] nonce, int n) throws Exception {
+        Cipher stream = Cipher.getInstance("AES/GCM/NoPadding");
+        stream.init(Cipher.ENCRYPT_MODE, new SecretKeySpec(key, "AES"),
+                new GCMParameterSpec(GCM_TAG_LEN * 8, nonce));
+        byte[] out = new byte[n];
+        int produced = 0;
+        int pos = 0;
+        byte[] zeros = new byte[Math.min(64 * 1024, Math.max(1, n))];
+        while (produced < n) {
+            int want = Math.min(zeros.length, n - produced);
+            byte[] part = stream.update(zeros, 0, want);
+            if (part != null && part.length > 0) {
+                int take = Math.min(part.length, n - pos);
+                System.arraycopy(part, 0, out, pos, take);
+                pos += take;
             }
-            y = gfMul(y, h);
-        }
-        return y;
-    }
-
-    /** Multiplikation in GF(2^128), Bit-fuer-Bit, MSB zuerst. */
-    private static byte[] gfMul(byte[] a, byte[] b) {
-        byte[] z = new byte[16];
-        byte[] v = b.clone();
-        for (int i = 0; i < 128; i++) {
-            int bit = (a[i / 8] >>> (7 - (i % 8))) & 1;
-            if (bit != 0) {
-                for (int k = 0; k < 16; k++) {
-                    z[k] ^= v[k];
-                }
-            }
-            boolean lsb = (v[15] & 1) != 0;
-            // v >>= 1
-            for (int k = 15; k > 0; k--) {
-                v[k] = (byte) ((v[k] >>> 1) | ((v[k - 1] & 1) << 7));
-            }
-            v[0] = (byte) (v[0] >>> 1);
-            if (lsb) {
-                v[0] ^= (byte) 0xe1;
-            }
-        }
-        return z;
-    }
-
-    /** AES-ECB-Blockverschluesselung (ein Block). */
-    private static byte[] aesEncryptBlock(byte[] key, byte[] block) throws Exception {
-        Cipher cipher = Cipher.getInstance("AES/ECB/NoPadding");
-        cipher.init(Cipher.ENCRYPT_MODE, new SecretKeySpec(key, "AES"));
-        return cipher.doFinal(block);
-    }
-
-    /** 128-Bit-Big-Endian-Zaehler um 1 erhoehen. */
-    private static byte[] incrementCounter(byte[] counter) {
-        byte[] out = counter.clone();
-        for (int i = out.length - 1; i >= 0; i--) {
-            if (++out[i] != 0) {
-                break;
-            }
+            produced += want;
         }
         return out;
     }
@@ -326,17 +256,217 @@ public final class Crypto {
             return false;
         }
         try {
-            byte[] iv = nonce.length >= 16
-                    ? Arrays.copyOfRange(nonce, 0, 16)
-                    : padded(nonce, 16);
             Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
             cipher.init(Cipher.DECRYPT_MODE, new SecretKeySpec(key, "AES"),
-                    new GCMParameterSpec(GCM_TAG_LEN * 8, iv));
+                    new GCMParameterSpec(GCM_TAG_LEN * 8, counter(nonce)));
             cipher.doFinal(data);
             return true;
         } catch (Exception e) {
             return false;
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Streaming-Entschluesselung ( fuer grosse Dateien )
+    // -----------------------------------------------------------------
+
+    /**
+     * Schema A: streamt eine Datei im AES-CTR-Modus in {@code out}.
+     *
+     * <p>Der Speicherbedarf bleibt konstant, unabhaengig von der
+     * Dateigroesse. Das ist der entscheidende Punkt fuer Backups im
+     * zweistelligen Gigabyte-Bereich.
+     *
+     * @return Anzahl geschriebener Klartext-Byte
+     */
+    public static long decryptCtrStream(byte[] key, byte[] iv, InputStream in,
+                                        OutputStream out, int chunkSize) throws IOException {
+        try {
+            Cipher cipher = Cipher.getInstance("AES/CTR/NoPadding");
+            cipher.init(Cipher.DECRYPT_MODE, new SecretKeySpec(key, "AES"),
+                    new IvParameterSpec(counter(iv)));
+            return pump(cipher, in, out, chunkSize);
+        } catch (IOException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new IOException("CTR-Entschluesselung fehlgeschlagen: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * Schema B: streamt eine Datei im GCM-Modus in {@code out}.
+     *
+     * <p>Der Tag am Dateiende wird abgetrennt und separat geprueft.
+     * Der Klartext wird auch dann geschrieben, wenn der Tag nicht passt
+     * (durch den Backup-Abbruch verkuerzte Datei) - die Authentizitaet
+     * wird dann als "nicht bestaetigt" ausgewiesen.
+     *
+     * @param hasTag true, wenn die Datei den GCM-Tag enthaelt
+     * @return Anzahl geschriebener Klartext-Byte
+     */
+    public static long decryptGcmStream(byte[] key, byte[] nonce, InputStream in,
+                                        OutputStream out, long cipherLen, int chunkSize)
+            throws IOException {
+        try {
+            // Keystream erzeugen. Der Provider liefert bei
+            // GCM-ENCRYPT im ENCRYPT-Modus zu update(zeros) genau so
+            // viele Byte zurueck, wie Nullen uebergeben wurden - das
+            // ist der Keystream (Null XOR Keystream = Keystream).
+            // Der GCM-Tag wird dabei NICHT berechnet und stört nicht.
+            Cipher stream = Cipher.getInstance("AES/GCM/NoPadding");
+            stream.init(Cipher.ENCRYPT_MODE, new SecretKeySpec(key, "AES"),
+                    new GCMParameterSpec(GCM_TAG_LEN * 8, counter(nonce)));
+
+            byte[] buf = new byte[chunkSize];
+            byte[] zeros = new byte[chunkSize];
+            long total = 0;
+            long remaining = cipherLen;
+
+            // Der Provider puffert den GCM-ENCRYPT-Stream intern: update()
+            // liefert nur volle 16-Byte-Bloecke zurueck. Der Rest
+            // bleibt im Provider-Puffer. Deshalb wird der gelieferte
+            // Keystream gesammelt, bis genug fuer den Chiffrat-Block
+            // vorliegt.
+            byte[] ks = new byte[0];
+
+            while (remaining > 0) {
+                int want = (int) Math.min(chunkSize, remaining);
+                int n = in.read(buf, 0, want);
+                if (n <= 0) {
+                    break;
+                }
+                byte[] part = stream.update(zeros, 0, n);
+                if (part != null && part.length > 0) {
+                    byte[] merged = new byte[ks.length + part.length];
+                    System.arraycopy(ks, 0, merged, 0, ks.length);
+                    System.arraycopy(part, 0, merged, ks.length, part.length);
+                    ks = merged;
+                }
+                if (ks.length < n) {
+                    // Zu wenig Keystream: mehr anfordern. update() mit
+                    // Nullen erzeugt weiteren Keystream, ohne den
+                    // Chiffrat zu veraendern.
+                    byte[] more = stream.update(zeros, 0, 0);
+                    if (more != null && more.length > 0) {
+                        byte[] merged = new byte[ks.length + more.length];
+                        System.arraycopy(ks, 0, merged, 0, ks.length);
+                        System.arraycopy(more, 0, merged, ks.length, more.length);
+                        ks = merged;
+                    }
+                }
+                if (ks.length < n) {
+                    // Letzte Chance: Rest aus dem Provider holen.
+                    byte[] tail = stream.doFinal();
+                    if (tail != null && tail.length > 0) {
+                        byte[] merged = new byte[ks.length + tail.length];
+                        System.arraycopy(ks, 0, merged, 0, ks.length);
+                        System.arraycopy(tail, 0, merged, ks.length, tail.length);
+                        ks = merged;
+                    }
+                }
+                if (ks.length < n) {
+                    throw new IOException("Provider lieferte zu wenig Keystream ("
+                            + ks.length + " < " + n + ")");
+                }
+                for (int i = 0; i < n; i++) {
+                    buf[i] ^= ks[i];
+                }
+                // Nicht verbrauchten Keystream fuer den naechsten Block
+                // behalten.
+                byte[] rest = new byte[ks.length - n];
+                System.arraycopy(ks, n, rest, 0, rest.length);
+                ks = rest;
+                out.write(buf, 0, n);
+                total += n;
+                remaining -= n;
+            }
+            return total;
+        } catch (IOException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new IOException("GCM-Entschluesselung fehlgeschlagen: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * Prueft den GCM-Tag einer Datei, ohne sie vollstaendig zu laden.
+     *
+     * <p>Der Provider puffert den Chiffrat intern; erst {@code doFinal()}
+     * mit dem Tag liefert das Ergebnis. Der Klartext wird dabei nicht
+     * ausgegeben - dafuer ist {@link #decryptGcmStream} da.
+     *
+     * @param cipherLen Laenge des Chiffrats ohne Tag
+     * @param tag       die letzten 16 Byte der Datei
+     */
+    public static boolean verifyGcmTagStream(byte[] key, byte[] nonce, InputStream in,
+                                              long cipherLen, byte[] tag) {
+        if (tag == null || tag.length != GCM_TAG_LEN) {
+            return false;
+        }
+        try {
+            Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
+            cipher.init(Cipher.DECRYPT_MODE, new SecretKeySpec(key, "AES"),
+                    new GCMParameterSpec(GCM_TAG_LEN * 8, counter(nonce)));
+            byte[] buf = new byte[64 * 1024];
+            long remaining = cipherLen;
+            while (remaining > 0) {
+                int want = (int) Math.min(buf.length, remaining);
+                int n = in.read(buf, 0, want);
+                if (n <= 0) {
+                    break;
+                }
+                cipher.update(buf, 0, n);
+                remaining -= n;
+            }
+            cipher.doFinal(tag);
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /**
+     * Streamt Ciphertext durch einen Cipher in {@code out}.
+     *
+     * <p>Der Cipher liefert bei CTR sofort Klartext; bei GCM im
+     * DECRYPT-Modus gibt {@code update()} nichts zurueck, daher wird
+     * dort {@link #decryptGcmStream(byte[], byte[], InputStream, OutputStream, boolean, int)}
+     * verwendet.
+     */
+    private static long pump(Cipher cipher, InputStream in, OutputStream out, int chunkSize)
+            throws IOException {
+        byte[] buf = new byte[chunkSize];
+        long total = 0;
+        int n;
+        try {
+            while ((n = in.read(buf)) > 0) {
+                byte[] part = cipher.update(buf, 0, n);
+                if (part != null && part.length > 0) {
+                    out.write(part);
+                    total += part.length;
+                }
+            }
+            byte[] tail = cipher.doFinal();
+            if (tail != null && tail.length > 0) {
+                out.write(tail);
+                total += tail.length;
+            }
+        } catch (IOException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new IOException("Stream-Entschluesselung fehlgeschlagen: " + e.getMessage(), e);
+        }
+        return total;
+    }
+
+    /** CTR-Zaehler auf 16 Byte bringen. */
+    private static byte[] counter(byte[] iv) {
+        if (iv.length >= 16) {
+            return Arrays.copyOfRange(iv, 0, 16);
+        }
+        byte[] out = new byte[16];
+        System.arraycopy(iv, 0, out, 0, Math.min(iv.length, 16));
+        return out;
     }
 
     private static byte[] padded(byte[] data, int len) {
@@ -347,8 +477,8 @@ public final class Crypto {
 
     /** Zufallsbytes - fuer Tests. */
     public static byte[] randomBytes(int n) {
-        byte[] b = new byte[n];
-        new java.security.SecureRandom().nextBytes(b);
-        return b;
+        byte[] out = new byte[n];
+        new java.security.SecureRandom().nextBytes(out);
+        return out;
     }
 }

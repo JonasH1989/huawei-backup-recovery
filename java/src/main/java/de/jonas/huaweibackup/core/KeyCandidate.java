@@ -10,17 +10,28 @@ import java.util.Arrays;
  *   <li>{@code B(passwort)} - Schema B, direkt aus Passwort + Salt</li>
  *   <li>{@code A(bkey)}      - Schema A, ueber den abgeleiteten bkey</li>
  * </ul>
+ *
+ * <p>{@code module} nennt das Backup-Modul, zu dem der Kandidat gehoert
+ * (z. B. {@code calllog}). Ohne diese Zuordnung wuerde jedes Modul
+ * jeden Schluessel probieren - bei einem 20-GB-Backup ein Vielfaches
+ * der Laufzeit.
  */
 public final class KeyCandidate {
 
     private final String label;
     private final byte[] key;
     private final byte[] iv;
+    private final String module;
 
     public KeyCandidate(String label, byte[] key, byte[] iv) {
+        this(label, key, iv, null);
+    }
+
+    public KeyCandidate(String label, byte[] key, byte[] iv, String module) {
         this.label = label;
         this.key = key;
         this.iv = iv;
+        this.module = module;
     }
 
     public String label() {
@@ -33,6 +44,11 @@ public final class KeyCandidate {
 
     public byte[] iv() {
         return iv;
+    }
+
+    /** Zugehoeriges Backup-Modul oder null, wenn moduluebergreifend. */
+    public String module() {
+        return module;
     }
 
     /** Schema des Kandidaten: "A" oder "B". */
@@ -61,6 +77,6 @@ public final class KeyCandidate {
 
     @Override
     public String toString() {
-        return label;
+        return module == null ? label : label + "[" + module + "]";
     }
 }

@@ -1,9 +1,11 @@
 package de.jonas.huaweibackup.core;
 
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Set;
 
 /**
@@ -19,6 +21,12 @@ import java.util.Set;
  *   <li><b>Schema A ueber den bkey</b> - braucht {@code e_perbackupkey}
  *       und {@code pwkey_salt} im geretteten XML-Fragment.</li>
  * </ol>
+ *
+ * <p><b>Modulbindung:</b> jeder Kandidat traegt das Modul, aus dem sein
+ * Salt stammt ({@code calllog}, {@code sms}, ...). Damit wird nicht mehr
+ * jeder Schluessel an jeder Datei durchprobiert, sondern zuerst das
+ * passende Modul. Das ist bei einem 20-GB-Backup der Unterschied
+ * zwischen Minuten und Stunden.
  */
 public final class CandidateBuilder {
 
@@ -41,13 +49,15 @@ public final class CandidateBuilder {
         Set<KeyCandidate> seen = new LinkedHashSet<>();
 
         // --- 1) Schema B: direkt aus dem Passwort ------------------------
-        List<byte[]> salts = collectSalts(scan);
-
-        for (byte[] enc : salts) {
+        for (Map.Entry<String, byte[]> e : collectSalts(scan).entrySet()) {
             try {
-                byte[][] keyAndNonce = Crypto.deriveKeyB(password, enc);
-                seen.add(new KeyCandidate("B(passwort)", keyAndNonce[0], keyAndNonce[1]));
-            } catch (Exception e) {
+                byte[][] keyAndNonce = Crypto.deriveKeyB(password, e.getValue());
+                KeyCandidate c = new KeyCandidate("B(passwort)", keyAndNonce[0],
+                        keyAndNonce[1], e.getKey());
+                if (seen.add(c)) {
+                    candidates.add(c);
+                }
+            } catch (Exception ex) {
                 // Kandidat faellt einfach weg
             }
         }
@@ -62,9 +72,13 @@ public final class CandidateBuilder {
                 bkeyOk = true;
                 log.add("  bkey erfolgreich abgeleitet (GCM-Tag gueltig)");
 
-                for (byte[] enc : salts) {
-                    byte[][] keyAndIv = Crypto.deriveFileKeyA(bkey, enc);
-                    seen.add(new KeyCandidate("A(bkey)", keyAndIv[0], keyAndIv[1]));
+                for (Map.Entry<String, byte[]> e : collectSalts(scan).entrySet()) {
+                    byte[][] keyAndIv = Crypto.deriveFileKeyA(bkey, e.getValue());
+                    KeyCandidate c = new KeyCandidate("A(bkey)", keyAndIv[0],
+                            keyAndIv[1], e.getKey());
+                    if (seen.add(c)) {
+                        candidates.add(c);
+                    }
                 }
             } catch (BadPasswordException e) {
                 log.add("  bkey nicht ableitbar (" + e.getMessage() + ")");
@@ -77,7 +91,7 @@ public final class CandidateBuilder {
         }
 
         if (passwordOk != null && passwordOk.length > 0) {
-            passwordOk[0] = bkeyOk || !candidates.isEmpty() || !salts.isEmpty();
+            passwordOk[0] = bkeyOk || !candidates.isEmpty();
         }
         candidates.addAll(seen);
         return candidates;
@@ -85,40 +99,99 @@ public final class CandidateBuilder {
 
     /**
      * Sammelt alle 48-Byte-Salts aus den Modulen und dem Blob-Pool.
+     *
+     * <p>Der Schluessel des Map-Eintrags ist der Modulname. Fuer
+     * Bloecke ohne Modulbezug (aus dem Rohtext-Pool) wird der Name
+     * {@code (allgemein)} verwendet - solche Kandidaten werden
+     * moduluebergreifend probiert.
      */
-    private List<byte[]> collectSalts(IndexScanner.Result scan) {
-        List<byte[]> salts = new ArrayList<>();
+    private Map<String, byte[]> collectSalts(IndexScanner.Result scan) {
+        Map<String, byte[]> salts = new LinkedHashMap<>();
 
-        for (String encHex : scan.modules.values()) {
-            addSalt(salts, encHex);
+        // Bekannte Nicht-Salt-Bloecke ausschliessen.
+        java.util.Set<String> nonSalt = new java.util.HashSet<>();
+        for (String b : scan.nonSaltBlobs) {
+            if (b != null) {
+                nonSalt.add(b.toLowerCase(Locale.ROOT));
+            }
         }
+
+        // 1) Module mit vollstaendigem Salt
+        for (Map.Entry<String, String> e : scan.modules.entrySet()) {
+            byte[] s = toSalt(e.getValue());
+            if (s != null) {
+                salts.put(e.getKey(), s);
+            }
+        }
+
+        // 2) Module mit ABGESCHNITTENEM Salt: der vollstaendige Wert
+        //    liegt an anderer Stelle im Backup. Gesucht wird ueber das
+        //    Praefix - der abgeschnittene Wert ist die ersten Zeichen
+        //    des vollstaendigen.
+        for (Map.Entry<String, String> e : scan.modules.entrySet()) {
+            if (salts.containsKey(e.getKey())) {
+                continue;
+            }
+            String prefix = e.getValue() == null ? "" : e.getValue().trim().toLowerCase(Locale.ROOT);
+            if (prefix.length() < 16) {
+                continue;
+            }
+            for (String blob : scan.blobPool) {
+                String b = blob.toLowerCase(Locale.ROOT);
+                if (b.length() >= 96 && b.startsWith(prefix)) {
+                    byte[] s = toSalt(blob);
+                    if (s != null) {
+                        salts.put(e.getKey(), s);
+                        break;
+                    }
+                }
+            }
+        }
+
+        // 3) Uebrige Bloecke als moduluebergreifende Kandidaten
         for (String blob : scan.blobPool) {
-            addSalt(salts, blob);
+            if (nonSalt.contains(blob.toLowerCase(Locale.ROOT))) {
+                continue;
+            }
+            byte[] s = toSalt(blob);
+            if (s != null) {
+                boolean known = false;
+                for (byte[] existing : salts.values()) {
+                    if (java.util.Arrays.equals(existing, s)) {
+                        known = true;
+                        break;
+                    }
+                }
+                if (!known) {
+                    salts.put("(allgemein)", s);
+                }
+            }
         }
         return salts;
     }
 
-    private static void addSalt(List<byte[]> salts, String hex) {
+    /**
+     * Hex -> 48-Byte-Salt (Salt 32 + Nonce 16).
+     *
+     * <p>Kuerzere Werte werden aufgefuellt - genau wie in der
+     * Python-Vorlage ({@code h[:96].ljust(96, "0")}).
+     */
+    private static byte[] toSalt(String hex) {
         if (hex == null) {
-            return;
+            return null;
         }
         String h = hex.trim();
         if (h.length() < 64) {
-            return;
+            return null;
         }
         try {
-            // 96 Hex-Zeichen = 48 Byte: Salt (32) + Nonce (16).
-            // Kuerzere Werte werden aufgefuellt - genau wie in der
-            // Python-Vorlage (h[:96].ljust(96, "0")).
             String padded = h.length() >= 96
                     ? h.substring(0, 96)
                     : h + "0".repeat(96 - h.length());
             byte[] b = hexToBytes(padded);
-            if (b.length == 48) {
-                salts.add(b);
-            }
+            return b.length == 48 ? b : null;
         } catch (IllegalArgumentException e) {
-            // Kein gueltiges Hex - ueberspringen
+            return null;
         }
     }
 

@@ -88,7 +88,8 @@ public final class TestBackupBuilder {
         // nicht beliebige Bytes.
         byte[] bkeyBytes = hex(Crypto.randomBytes(16)).getBytes(StandardCharsets.UTF_8);
 
-        byte[] nonce = Arrays.copyOfRange(pwkeySalt, 16, 28);
+        // 16-Byte-Nonce - am echten Backup verifiziert.
+        byte[] nonce = Arrays.copyOfRange(pwkeySalt, 16, 32);
         // doFinal() liefert bei GCM Chiffrat || Tag - daraus ergibt sich
         // e_perbackupkey (= Chiffrat || GCM-Tag).
         Cipher gcm = Cipher.getInstance("AES/GCM/NoPadding");
@@ -135,10 +136,10 @@ public final class TestBackupBuilder {
         if (corruptInfo) {
             // Abbruch mitten im Attribut -> XML nicht wohlgeformt
             Files.writeString(infoPath, info.replace(encHex, encHex.substring(0, 40)));
-            // Rohtext-Rettung braucht den Wert noch irgendwo
-            byte[] blob = new byte[hexBytes(encmsgv3).length + 16];
-            System.arraycopy(hexBytes(encmsgv3), 0, blob, 0, hexBytes(encmsgv3).length);
-            Files.write(root.resolve("cinfoset.dat"), blob);
+            // Rohtext-Rettung: der vollstaendige Wert liegt an
+            // anderer Stelle im Backup als Text (so wie im echten
+            // HiSuite-Backup).
+            Files.writeString(root.resolve("cinfoset.dat"), encHex + "\n");
         } else {
             Files.writeString(infoPath, info);
         }

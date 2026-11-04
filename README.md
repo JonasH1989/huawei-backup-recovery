@@ -277,3 +277,60 @@ huawei-backup-recovery/
 - `kellynull2026/huawei-backup-decrypt` – Schema B (KoBackup v13), AES-256-GCM
 - `RealityNet/kobackupdec` – AES-256-CTR, `checkMsgV3`-HMAC-Prüfung
 - `irsl/Huawei-Hisuite-KobackupCipherTool` – Java-Referenzimplementierung
+
+## Version 1.1.0 - am echten Backup verifiziert
+
+Die Version 1.0.0 blieb bei einem 20-GB-Backup bei 0 % stehen. Ursache
+waren vier Engpaesse, die jetzt behoben sind:
+
+1. **Kein Streaming.** Jede Datei wurde vollstaendig in den Speicher
+   gelesen (`Files.readAllBytes`). Bei 20 GB bedeutet das ein Vielfaches
+   des Speichers. Jetzt wird blockweise (4 MB) gelesen und geschrieben.
+   Nachgewiesen: 300 MB Datei mit nur 128 MB Heap entschluesselt, das
+   Ergebnis ist bytegenau identisch.
+
+2. **Rohtext-Suche las das ganze Backup.** Der Index-Scanner las jede
+   Datei komplett ein. Jetzt wird nur ein Fenster am Dateianfang
+   gelesen (2 MB) - der Index liegt am Anfang.
+
+3. **Jede Datei wurde mit jedem Kandidaten entschluesselt.** Bei 30
+   Kandidaten und 5.000 Dateien sind das 150.000 volle
+   Entschluesselungen. Jetzt traegt jeder Kandidat sein Modul
+   (`calllog`, `sms`, ...); das passende Modul wird zuerst probiert.
+
+4. **Kein Fortschritt in der Index-Phase.** Die Anzeige blieb bei 0 %.
+   Jetzt wird auch die Index-Phase gemeldet.
+
+### Der entscheidende Bugfix: die GCM-Nonce ist 16 Byte lang
+
+Der bkey-Schritt benutzt als GCM-Nonce `pwkey_salt[16:32]` - **nicht**
+`pwkey_salt[16:28]` (12 Byte). Mit 12 Byte schlug der GCM-Tag fehl und
+das Passwort wurde faelschlich als falsch gemeldet. Am echten Backup
+verifiziert: mit 16 Byte wird der bkey korrekt abgeleitet, mit 12 Byte
+nicht.
+
+### Recovery eines abgeschnittenen Index
+
+Faellt die `info.xml` mitten in einem Attribut aus, wird der Wert am
+Praefix wiedererkannt. Der vollstaendige Wert wird an anderer Stelle im
+Backup gesucht (Rohtext-Rettung). Zusaetzlich werden abgeschnittene
+Hex-Werte mit Nullen aufgefuellt - ob der Kandidat taugt, entscheidet
+anschliessend die Signaturpruefung.
+
+### Was am echten Backup nachgewiesen wurde
+
+Das Huawei P30 (EML-L29, HiSuite 10) mit Schema A wurde mit dem
+Original-Passwort und der beschädigten `info.xml` erfolgreich
+entschluesselt:
+
+- `calllog.db` (606.208 Byte) -> gueltige SQLite-Datenbank mit 1.968
+  Anrufen - exakt die in der `info.xml` angegebene `recordTotal`.
+- Der bkey wird aus `e_perbackupkey` und `pwkey_salt` abgeleitet und
+  der GCM-Tag bestaetigt das Passwort.
+
+### Nicht gelöst: Dateien mit `isCopyFileEncrypt=true`
+
+Die Audioaufnahme aus dem Ordner `soundrecorder` ist mit einem eigenen
+Verfahren verschluesselt, das weder Schema A noch Schema B entspricht.
+Sie bleibt vorerst unentschluesselt. Die uebrigen Module (`sms`,
+`calllog`, `Memo`) werden korrekt entschluesselt.
