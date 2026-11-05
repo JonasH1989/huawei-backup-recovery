@@ -125,3 +125,13 @@ im Backup nicht vorhanden.
 
 Naechster Schritt: das vollstaendige 20-GB-Backup, damit die Tiefensuche die
 fehlende Multimedia-XML bzw. den Copy-File-IV findet.
+
+## 2026-11-05 04:00 — Aus MEMORY.md archiviert (Dreaming-Routine)
+
+Die Abschnitte „Huawei-Backup-Recovery — Erfolg am echten Backup (2026-11-04)",
+„Huawei: Audio-Datei (WhatsApp/Sprachnachricht) noch nicht entschlüsselt (2026-11-04)"
+sowie die Updates zu v1.2.0/v1.3.0 standen wörtlich in `MEMORY.md` und wurden am
+2026-11-05 aus dem Inhaltsverzeichnis entfernt. Volltext-Archiv: `memory/2026-11-05.md`
+(Originalabschnitte, nichts gelöscht). Fachstand unverändert in dieser Datei sowie in
+`docs/ALGORITHMUS.md` und `docs/GCM-IN-JAVA.md`.
+<!-- project: path:/home/openclaw/.openclaw/workspace -->
