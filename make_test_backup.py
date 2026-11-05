@@ -11,6 +11,7 @@ mitten im Attribut passiert - exakt das Szenario aus dem Backup.
 from __future__ import annotations
 
 import binascii
+import hashlib
 import io
 import os
 import shutil
@@ -60,6 +61,11 @@ def _db_bytes(n=1500):
     return b"SQLite format 3\x00" + b"ROWDATA" * (n // 7)
 
 
+def _ogg_bytes(n=4000):
+    """Minimaler Ogg/Opus-Kopf (OggS-Signatur)."""
+    return b"OggS" + b"\x00" * 8 + b"\x01\x1e" + b"\x00" * (n - 10)
+
+
 PAYLOADS = {
     "photo/DCIM/IMG_0001.jpg": _jpg_bytes(),
     "photo/DCIM/IMG_0002.jpg": _jpg_bytes(),
@@ -83,7 +89,10 @@ def build_schema_a(root: Path, corrupt_info: bool = False):
     bkey_str = binascii.hexlify(get_random_bytes(16)).decode("utf-8")
     bkey_bytes = bkey_str.encode("utf-8")
 
-    nonce = pwkey_salt[16:28]
+    # WICHTIG: die GCM-Nonce des bkey-Schritts ist 16 Byte lang
+    # (pwkey_salt[16:32]). Mit 12 Byte schlaegt der GCM-Tag fehl - das
+    # wurde am echten Backup verifiziert (siehe RECOVERY-NOTES.md).
+    nonce = pwkey_salt[16:32]
     cipher = AES.new(K, AES.MODE_GCM, nonce=nonce, mac_len=16)
     epbk_ct = cipher.encrypt(bkey_bytes)
     epbk = epbk_ct + cipher.digest()
@@ -181,6 +190,81 @@ def build_schema_b(root: Path, corrupt_info: bool = False):
     return {"encmsgv3": encmsgv3}
 
 
+def build_copy_file(root: Path):
+    """Copy-File-Variante (isCopyFileEncrypt=true).
+
+    Mediendateien werden nicht ueber encMsgV3 abgeleitet, sondern ueber
+    eine EIGENE IV pro Datei aus der Multimedia-XML:
+
+        Key = SHA256(bkey)[0:16]  (AES-128)
+        IV  = der <Iv>-Wert der Datei
+        Modus = AES-256-CTR
+
+    Genau dieser Weg liess die WhatsApp-Sprachnachricht aus dem Modul
+    `soundrecorder` bisher unentschluesselt.
+    """
+    root.mkdir(parents=True, exist_ok=True)
+
+    pwkey_salt = get_random_bytes(32)
+    K = PBKDF2(PASSWORD.encode(), pwkey_salt[:16], 32, PBKDF2_ITER_BKEY, _prf_sha256)
+    bkey_str = binascii.hexlify(get_random_bytes(16)).decode("utf-8")
+
+    # WICHTIG: die GCM-Nonce des bkey-Schritts ist 16 Byte lang
+    # (pwkey_salt[16:32]). Mit 12 Byte schlaegt der GCM-Tag fehl - das
+    # wurde am echten Backup verifiziert (siehe RECOVERY-NOTES.md).
+    nonce = pwkey_salt[16:32]
+    cipher = AES.new(K, AES.MODE_GCM, nonce=nonce, mac_len=16)
+    epbk_ct = cipher.encrypt(bkey_str.encode("utf-8"))
+    epbk = epbk_ct + cipher.digest()
+
+    media_key = hashlib.sha256(bkey_str.encode("utf-8")).digest()[:16]
+
+    from Crypto.Util import Counter
+
+    media_files = {
+        "/Sounds/AUD-20261026-WA0001---aaaa.ogg": _ogg_bytes(),
+        "/Sounds/AUD-20261026-WA0002---bbbb.ogg": _ogg_bytes(),
+    }
+
+    files_xml = []
+    for abs_path, data in media_files.items():
+        # Eigene IV pro Datei.
+        iv = get_random_bytes(16)
+        ctr = Counter.new(128, initial_value=int.from_bytes(iv, "big"),
+                          little_endian=False)
+        enc = AES.new(media_key, AES.MODE_CTR, counter=ctr).encrypt(data)
+
+        rel = abs_path.lstrip("/")
+        dst = root / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_bytes(enc)
+
+        files_xml.append("    <File><Path>%s</Path><Iv>%s</Iv></File>"
+                         % (abs_path, binascii.hexlify(iv).decode()))
+
+    multimedia = ("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"
+                  "<Multimedia>\n" + "\n".join(files_xml) + "\n</Multimedia>\n")
+    (root / "multimedia.xml").write_text(multimedia, encoding="utf-8")
+
+    enc_hex = binascii.hexlify(get_random_bytes(48)).decode()
+    info = f"""<?xml version="1.0" encoding="utf-8"?>
+<root>
+  <row table="BackupFilesTypeInfo">
+    <column name="e_perbackupkey"><value String="{binascii.hexlify(epbk).decode()}"/></column>
+    <column name="pwkey_salt"><value String="{binascii.hexlify(pwkey_salt).decode()}"/></column>
+  </row>
+  <row table="BackupFileModuleInfo_Media">
+    <column name="name"><value String="soundrecorder"/></column>
+    <column name="encMsgV3"><value String="{enc_hex}"/></column>
+  </row>
+</root>
+"""
+    (root / "info.xml").write_text(info, encoding="utf-8")
+
+    return {"bkey": bkey_str, "epbk": epbk, "pwkey_salt": pwkey_salt,
+            "media_key": media_key}
+
+
 def main():
     base = Path(sys.argv[1] if len(sys.argv) > 1 else "/tmp/hw_test")
     if base.exists():
@@ -191,6 +275,7 @@ def main():
         ("schema_a_corrupt", lambda p: build_schema_a(p, corrupt_info=True)),
         ("schema_b", lambda p: build_schema_b(p)),
         ("schema_b_corrupt", lambda p: build_schema_b(p, corrupt_info=True)),
+        ("copy_file", lambda p: build_copy_file(p)),
     ]
 
     for name, builder in cases:

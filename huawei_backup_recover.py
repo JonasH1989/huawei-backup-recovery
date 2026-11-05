@@ -88,12 +88,24 @@ SIGNATURES = (
     (b"\x1aE\xdf\xa3",                 ".mkv"),
     (b"fLaC",                          ".flac"),
     (b"ID3",                           ".mp3"),
+    (b"OggS",                          ".ogg"),
     (b"<?xml",                         ".xml"),
     (b"PK\x03\x04",                    ".zip"),
 )
 
 # MP4/MOV: 'ftyp' steht bei Byte 4
 MP4_BRANDS = (b"isom", b"mp42", b"mp41", b"isom", b"avc1", b"qt  ", b"MSNV", b"3gp")
+
+# ---------------------------------------------------------------------------
+# MPEG-Audio-Frame (fuer MP3 ohne ID3-Tag)
+# ---------------------------------------------------------------------------
+
+# Bitraten in kBit/s, Index = Bitratefeld (MPEG-1 Layer III zuerst).
+_BITRATES = (0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0)
+# Abtastraten MPEG 1 (Layer III) in Hz.
+_SAMPLERATES_M1 = (44100, 48000, 32000, 0)
+# Abtastraten MPEG 2 / 2.5 in Hz.
+_SAMPLERATES_M2 = (22050, 24000, 16000, 0)
 
 
 def _prf_sha256(p: bytes, s: bytes) -> bytes:
@@ -387,12 +399,103 @@ def derive_key_b(password: str, encmsgv3: bytes) -> tuple[bytes, bytes]:
 # Entschluesselung + Verifikation
 # ---------------------------------------------------------------------------
 
+def _is_mpeg_frame_sync(b: bytes, p: int) -> bool:
+    """Prueft, ob an Position p ein gueltiger MPEG-Frame-Header steht.
+
+    Ein Frame beginnt mit 11 Einsen. Danach folgen:
+      Byte 1: 111 VV LL P   (Version, Layer, Protection)
+      Byte 2: BBBB SS Pd    (Bitrate, Samplerate, Padding)
+
+    Damit Zufallstreffer ausgeschlossen sind, muessen Layer und
+    Version gueltig sein und Bitrate-/Samplerate-Index keine
+    reservierten Werte tragen.
+    """
+    if p + 4 > len(b):
+        return False
+    b0, b1, b2 = b[p] & 0xFF, b[p + 1] & 0xFF, b[p + 2] & 0xFF
+    if b0 != 0xFF or (b1 & 0xE0) != 0xE0:
+        return False
+    version = (b1 >> 3) & 0x03
+    layer = (b1 >> 1) & 0x03
+    if version == 1 or layer == 0:
+        return False
+    bitrate_index = (b2 >> 4) & 0x0F
+    samplerate_index = (b2 >> 2) & 0x03
+    return bitrate_index != 0x0F and samplerate_index != 3
+
+
+def _mpeg_frame_length(b: bytes, p: int) -> int:
+    """Berechnet die Laenge eines MPEG-Frames in Byte (0 = unbestimmbar)."""
+    if p + 4 > len(b):
+        return 0
+    b1, b2 = b[p + 1] & 0xFF, b[p + 2] & 0xFF
+    version = (b1 >> 3) & 0x03
+    layer = (b1 >> 1) & 0x03
+    bitrate_index = (b2 >> 4) & 0x0F
+    samplerate_index = (b2 >> 2) & 0x03
+    padding = (b2 >> 1) & 0x01
+    bitrate = _BITRATES[bitrate_index]
+    samplerate = (_SAMPLERATES_M1[samplerate_index] if version == 3
+                  else _SAMPLERATES_M2[samplerate_index])
+    if bitrate == 0 or samplerate == 0:
+        return 0
+    if layer == 3:
+        return (12 * bitrate * 1000 // samplerate + padding) * 4
+    if layer == 2:
+        return 144 * bitrate * 1000 // samplerate + padding
+    if version == 3:
+        return 144 * bitrate * 1000 // samplerate + padding
+    return 72 * bitrate * 1000 // samplerate + padding
+
+
+def _count_mpeg_frames(b: bytes, p: int) -> int:
+    """Zaehlt aufeinanderfolgende gueltige MPEG-Frames ab Position p."""
+    count = 0
+    while p + 4 <= len(b) and count < 64:
+        if not _is_mpeg_frame_sync(b, p):
+            break
+        length = _mpeg_frame_length(b, p)
+        if length < 4:
+            break
+        count += 1
+        p += length
+    return count
+
+
+def _looks_like_mp3_stream(head: bytes) -> bool:
+    """Prueft, ob der Anfang eine Folge gueltiger MPEG-Audio-Frames ist.
+
+    WICHTIG: ein einzelner Sync reicht NICHT als Beweis. In Zufallsdaten
+    tritt 0xFFEx alle ~5.600 Byte auf - bei einer 4-KB-Probe waere ein
+    Fehlalarm wahrscheinlich. Deshalb werden mindestens drei
+    aufeinanderfolgende Frames an den erwarteten Positionen geprueft.
+    """
+    if len(head) < 32:
+        return False
+    start = 0
+    if head[:3] == b"ID3":
+        if len(head) < 10:
+            return False
+        size = ((head[6] & 0x7F) << 21) | ((head[7] & 0x7F) << 14) \
+            | ((head[8] & 0x7F) << 7) | (head[9] & 0x7F)
+        start = 10 + size
+        if start >= len(head):
+            # Der ID3-Header allein gilt als Beweis.
+            return True
+    return _count_mpeg_frames(head, start) >= 3
+
+
 def detect_extension(head: bytes) -> str | None:
     for sig, ext in SIGNATURES:
         if head.startswith(sig):
             return ext
     if len(head) >= 12 and head[4:8] == b"ftyp" and head[8:12] in MP4_BRANDS:
         return ".mp4"
+    # MP3 ohne ID3-Tag: der MPEG-Frame-Sync beginnt direkt.
+    # Wichtig fuer Huawei-Sprachnachrichten, die oft ohne ID3
+    # gespeichert werden.
+    if _looks_like_mp3_stream(head):
+        return ".mp3"
     return None
 
 
@@ -458,9 +561,171 @@ def verify_gcm_tag(key: bytes, nonce: bytes, data: bytes) -> bool:
         return False
 
 
+# ---------------------------------------------------------------------------
+# Media-Index (Copy-Files / Multimedia-XML)
+# ---------------------------------------------------------------------------
+#
+# Mediendateien (Audio/Foto/Video) werden in manchen Backup-Versionen
+# nicht ueber encMsgV3 abgeleitet, sondern ueber eine EIGENE IV pro
+# Datei aus einer Multimedia-XML:
+#
+#   <Multimedia><File><Path>/Sounds/AUD-....mp3</Path><Iv>HEX</Iv></File></Multimedia>
+#
+# Key = SHA256(bkey)[0:16] (AES-128), Modus = AES-256-CTR.
+# Ohne diese XML bleibt die Datei unentschluesselbar - die IV laesst
+# sich nicht aus der Datei ableiten.
+
+_MULTIMEDIA_ROOT_RE = re.compile(r"<Multimedia\b", re.IGNORECASE)
+_PATH_TAG_RE = re.compile(r"<Path>\s*(.*?)\s*</Path>", re.S)
+_IV_TAG_RE = re.compile(r"<Iv>\s*([0-9a-fA-F]+)\s*</Iv>", re.S)
+_MAX_XML_BYTES = 32 * 1024 * 1024
+
+
+def _normalize_path(p: str) -> str:
+    """Vereinheitlicht Pfade: Trennzeichen, fuehrende Trenner, './'.
+
+    Kleinschreibung, weil der Index und das Dateisystem unterschiedliche
+    Gross-/Kleinschreibung verwenden koennen.
+    """
+    s = p.replace("\\", "/").strip()
+    while s.startswith("./"):
+        s = s[2:]
+    s = s.lstrip("/")
+    return s.lower()
+
+
+def _read_text_fallback(p: Path) -> str:
+    """Liest eine Datei als Text (UTF-8, Fallback ISO-8859-1/BOM)."""
+    raw = p.read_bytes()
+    if raw[:2] == b"\xff\xfe":
+        return raw.decode("utf-16-le", errors="ignore")
+    if raw[:2] == b"\xfe\xff":
+        return raw.decode("utf-16-be", errors="ignore")
+    return raw.decode("utf-8", errors="ignore")
+
+
+class MediaIndex:
+    """Zuordnung Dateipfad -> IV aus den Multimedia-Indizes des Backups."""
+
+    def __init__(self) -> None:
+        self.path_to_iv: dict[str, str] = {}
+        self.source_files: list[str] = []
+
+    # -- Aufbau ----------------------------------------------------------
+
+    @classmethod
+    def scan(cls, root: Path) -> "MediaIndex":
+        """Durchsucht das Backup nach Multimedia-Indizes."""
+        index = cls()
+        for p in root.rglob("*.xml"):
+            try:
+                if not p.is_file() or p.stat().st_size > _MAX_XML_BYTES:
+                    continue
+                xml = _read_text_fallback(p)
+            except OSError:
+                continue
+            if not _MULTIMEDIA_ROOT_RE.search(xml):
+                continue
+            index.parse(xml)
+            index.source_files.append(str(p))
+        return index
+
+    def parse(self, xml: str) -> None:
+        """Parst eine Multimedia-XML.
+
+        Die Datei kann abgeschnitten sein. Deshalb wird nicht auf eine
+        vollstaendige Struktur vertraut, sondern jedes <File>-Segment
+        einzeln ausgewertet: ein Block mit <Path> und <Iv> ist auch dann
+        nutzbar, wenn der Rest abgeschnitten wurde.
+        """
+        pos = 0
+        while True:
+            start = xml.find("<File", pos)
+            if start < 0:
+                break
+            end = xml.find("</File>", start)
+            block = xml[start:] if end < 0 else xml[start:end]
+            pos = len(xml) if end < 0 else end + len("</File>")
+
+            pm = _PATH_TAG_RE.search(block)
+            if not pm:
+                continue
+            path = pm.group(1).strip()
+            if not path:
+                continue
+            vm = _IV_TAG_RE.search(block)
+            if not vm:
+                # Abgeschnittene IV - die Datei bleibt unentschluesselbar.
+                continue
+            iv = vm.group(1).strip()
+            if len(iv) < 32:
+                continue
+            self.path_to_iv[_normalize_path(path)] = iv
+
+    # -- Abfrage ---------------------------------------------------------
+
+    def iv_for(self, file: Path, backup_root: Path) -> str | None:
+        """Liefert die IV zu einer Datei im Backup.
+
+        Der Pfad wird in mehreren Schreibweisen gesucht, weil der
+        absolute Pfad aus der XML und der relative Pfad im Backup selten
+        identisch sind.
+        """
+        candidates: list[str] = []
+        try:
+            rel = file.relative_to(backup_root)
+            candidates.append(_normalize_path(str(rel)))
+        except ValueError:
+            pass
+        name = file.name
+        candidates.append(_normalize_path(name))
+        # Ohne Suffix - der Index nennt oft den Namen ohne Endung.
+        dot = name.rfind(".")
+        stem = name[:dot] if dot > 0 else name
+        candidates.append(_normalize_path(stem))
+        parent = file.parent.name if file.parent else ""
+        if parent:
+            candidates.append(_normalize_path(parent + "/" + name))
+            # Der Index nennt haeufig den Pfad OHNE Endung, das Dateisystem
+            # hat sie. Deshalb auch die Kombination Ordner/Name-ohne-Endung.
+            candidates.append(_normalize_path(parent + "/" + stem))
+
+        for c in candidates:
+            iv = self.path_to_iv.get(c)
+            if iv is not None:
+                return iv
+
+        # Notfalls ueber das Dateiende der Pfadliste suchen.
+        file_key = _normalize_path(name)
+        for key, iv in self.path_to_iv.items():
+            if key and (key.endswith("/" + file_key) or key == file_key):
+                return iv
+        return None
+
+    def size(self) -> int:
+        return len(self.path_to_iv)
+
+    def entries(self) -> dict[str, str]:
+        return self.path_to_iv
+
+
+def derive_media_key(bkey: str) -> bytes:
+    """Copy-File-/Media-Key: SHA256(bkey)[0:16] (AES-128)."""
+    import hashlib
+    return hashlib.sha256(bkey.encode("utf-8")).digest()[:16]
+
+
+# ---------------------------------------------------------------------------
+# Schluessel-Kandidaten
+# ---------------------------------------------------------------------------
+
 def build_candidates(password: str, modules: dict, e_pbk, pwkey,
-                     blob_pool: list[str]) -> list[tuple[str, bytes, bytes]]:
-    """Alle plausiblen (Schluessel, iv)-Kandidaten erzeugen."""
+                     blob_pool: list[str]) -> tuple[list[tuple[str, bytes, bytes]], str | None]:
+    """Alle plausiblen (Schluessel, iv)-Kandidaten erzeugen.
+
+    Rueckgabe: (Kandidaten, bkey). Der bkey wird zusaetzlich zurueckgegeben,
+    weil der Copy-File-/Media-Weg ihn braucht (Key = SHA256(bkey)[0:16]).
+    """
     cands: list[tuple[str, bytes, bytes]] = []
     seen = set()
 
@@ -512,7 +777,7 @@ def build_candidates(password: str, modules: dict, e_pbk, pwkey,
             except Exception:
                 pass
 
-    return cands
+    return cands, bkey
 
 
 # ---------------------------------------------------------------------------
@@ -591,7 +856,7 @@ def cmd_inspect(args) -> int:
 
     print("\n=== Passwort-Probe (nur lesend, entschluesselt nichts) ===")
     pw = get_password()
-    cands = build_candidates(pw, modules, e_pbk, pwkey, blob_pool)
+    cands, bkey = build_candidates(pw, modules, e_pbk, pwkey, blob_pool)
     print("  Schluessel-Kandidaten: %d" % len(cands))
     if not cands:
         print("  -> KEIN Schluessel ableitbar. Es fehlt entweder das Passwort")
@@ -639,11 +904,17 @@ def cmd_recover(args) -> int:
           % ("ja" if e_pbk else "NEIN", "ja" if pwkey else "NEIN"))
 
     pw = get_password()
-    cands = build_candidates(pw, modules, e_pbk, pwkey, blob_pool)
+    cands, bkey = build_candidates(pw, modules, e_pbk, pwkey, blob_pool)
     print("  Schluessel-Kandidaten: %d" % len(cands))
-    if not cands:
+    if not cands and not bkey:
         print("ERROR: kein Schluessel ableitbar")
         return 2
+
+    # Copy-File-/Media-Weg: eigene IV pro Datei aus der Multimedia-XML.
+    media_index = MediaIndex.scan(root)
+    print("  Multimedia-XML: %d | IVs: %d"
+          % (len(media_index.source_files), media_index.size()))
+    media_key = derive_media_key(bkey) if bkey else None
 
     payloads = collect_payload_files(root)
     print("\n=== Entschluesselung (%d Dateien) ===" % len(payloads))
@@ -661,6 +932,40 @@ def cmd_recover(args) -> int:
 
         head = raw[:4096]
         done = False
+
+        # Copy-File-/Media-Kandidat: eigene IV aus der Multimedia-XML,
+        # Key = SHA256(bkey)[0:16]. Muss VOR den Modul-Kandidaten
+        # probiert werden - eine Mediendatei gehoert zu keinem Modul
+        # und wuerde sonst nie getroffen.
+        if media_key is not None:
+            iv_hex = media_index.iv_for(p, root)
+            if iv_hex:
+                try:
+                    media_iv = binascii.unhexlify(iv_hex)
+                except binascii.Error:
+                    media_iv = b""
+                if len(media_iv) >= 16:
+                    dec = try_decrypt_a(media_key, media_iv, head, has_tag=False)
+                    if dec:
+                        ext = detect_extension(dec[:64])
+                        if ext:
+                            full = try_decrypt_a(media_key, media_iv, raw,
+                                                 has_tag=False)
+                            if full is not None:
+                                rel = p.relative_to(root)
+                                stem = rel.stem if rel.suffix else rel.name
+                                dst = out_root / rel.parent / (stem + ext)
+                                dst.parent.mkdir(parents=True, exist_ok=True)
+                                dst.write_bytes(full)
+                                ok += 1
+                                by_ext[ext] = by_ext.get(ext, 0) + 1
+                                print("  [%d/%d] %-46s -> %s (Copy-File)"
+                                      % (i, len(payloads), rel.name[:46], ext))
+                                done = True
+
+        if done:
+            continue
+
         for label, key, iv in cands:
             # Schema B: GCM-Tag steht am Dateiende -> muss abgetrennt
             # werden, sonst haengt 16 Byte Muell an der Datei.
