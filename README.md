@@ -328,12 +328,35 @@ entschluesselt:
 - Der bkey wird aus `e_perbackupkey` und `pwkey_salt` abgeleitet und
   der GCM-Tag bestaetigt das Passwort.
 
-### Nicht gelöst: Dateien mit `isCopyFileEncrypt=true`
+### Copy-Files (`isCopyFileEncrypt=true`) — Weg ist implementiert, IV fehlt im Teil-Backup
 
-Die Audioaufnahme aus dem Ordner `soundrecorder` ist mit einem eigenen
-Verfahren verschluesselt, das weder Schema A noch Schema B entspricht.
-Sie bleibt vorerst unentschluesselt. Die uebrigen Module (`sms`,
-`calllog`, `Memo`) werden korrekt entschluesselt.
+Dateien mit `isCopyFileEncrypt=true` (z. B. die Audioaufnahme aus dem
+Ordner `soundrecorder`) werden **nicht** ueber `encMsgV3` abgeleitet,
+sondern ueber eine **eigene IV pro Datei** aus einer Multimedia-XML:
+
+```xml
+<Multimedia><File><Path>/Sounds/AUD-....ogg</Path><Iv>HEX</Iv></File></Multimedia>
+```
+
+- Key: `SHA256(bkey)[0:16]` (AES-128)
+- IV: der `<Iv>`-Wert der Datei
+- Modus: AES-256-CTR
+
+Der Weg ist jetzt in **beiden** Tool-Varianten implementiert (Java:
+`MediaIndex`/`buildMediaCandidate`, Python: `MediaIndex`/`derive_media_key`).
+Die Datei wird auch dann entschluesselt, wenn die `info.xml` abgeschnitten
+ist - entscheidend ist nur, dass die Multimedia-XML im Backup liegt.
+
+**Am vorliegenden Teil-Backup scheitert es weiterhin an der IV**: fuer
+`soundrecorder` ist keine Multimedia-XML enthalten. Die IV laesst sich
+aus der Datei nicht ableiten - dafuer braucht es das vollstaendige
+20-GB-Backup, in dem die Tiefensuche die Multimedia-XML findet.
+Die uebrigen Module (`sms`, `calllog`, `Memo`) werden korrekt
+entschluesselt.
+
+Nachgewiesen am synthetischen Backup (`make_test_backup.py`, Fall
+`copy_file`): 2 OGG-Dateien ueber den Copy-File-Weg entschluesselt,
+Signatur `OggS` stimmt.
 
 ## Version 1.2.0 - Tiefensuche und MP3-Erkennung
 
